@@ -5,6 +5,7 @@ from src.memory_object import MemoryObject, ObjType
 from src.memory_manager import MemoryManager
 from src.dram_model import DRAMModel
 from src.energy_model import EnergyModel
+from src.resource_model import ResourceModel
 
 
 def _parse_sram_loc(loc_str: str):
@@ -37,6 +38,7 @@ class Simulator:
         self.dram = DRAMModel(config.dram, config.system.frequency_hz)
         self.energy = EnergyModel(config.energy, config.sram_pim,
                                   config.dram, config.system.frequency_hz)
+        self.resource = ResourceModel(config.sram_pim)
         self.cycle = 0
         self.commands = []
         self.completed = set()
@@ -47,6 +49,7 @@ class Simulator:
             "pim_compute_cycles": 0,
             "pim_reduce_cycles": 0,
             "stall_dependency_cycles": 0,
+            "bank_conflict_stall_cycles": 0,
         }
         self.correctness = {
             "illegal_read_unresident_object": 0,
@@ -60,6 +63,24 @@ class Simulator:
 
     def _deps_ready(self, cmd: TraceCommand) -> bool:
         return all(d in self.completed for d in cmd.deps)
+
+    def _get_banks(self, cmd: TraceCommand) -> list:
+        """Extract bank indices from a command for resource tracking."""
+        # Explicit banks list in attrs takes priority
+        if "banks" in cmd.attrs:
+            return list(cmd.attrs["banks"])
+        # Parse from dst location if it's an SRAM location
+        loc = cmd.dst if cmd.dst and cmd.dst.startswith("SRAM:") else (
+            cmd.src if cmd.src and cmd.src.startswith("SRAM:") else None
+        )
+        if loc:
+            try:
+                tile, local_banks = _parse_sram_loc(loc)
+                banks_per_tile = self.config.sram_pim.banks_per_tile
+                return [tile * banks_per_tile + b for b in local_banks]
+            except Exception:
+                pass
+        return []
 
     def _issue_command(self, cmd: TraceCommand) -> int:
         self.energy.add_command()
@@ -205,20 +226,36 @@ class Simulator:
         max_cycles = 100_000_000
 
         while (pending or self.event_queue) and self.cycle < max_cycles:
-            # Complete events at this cycle
+            # Release resources and complete events at this cycle
+            self.resource.release_at(self.cycle)
             while self.event_queue and self.event_queue[0][0] <= self.cycle:
                 _, cmd_id = heapq.heappop(self.event_queue)
                 self.completed.add(cmd_id)
 
-            # Find and issue ready commands
-            ready = [cid for cid, cmd in pending.items() if self._deps_ready(cmd)]
-            for cid in ready:
-                cmd = pending.pop(cid)
-                latency = self._issue_command(cmd)
-                if latency > 0:
-                    heapq.heappush(self.event_queue, (self.cycle + latency, cid))
+            # Find commands whose dependencies are met
+            deps_ready = [cid for cid, cmd in pending.items() if self._deps_ready(cmd)]
+
+            # Among those, check resource availability and issue if possible
+            issued_this_cycle = False
+            resource_stalled = []
+            for cid in deps_ready:
+                cmd = pending[cid]
+                banks = self._get_banks(cmd)
+                if self.resource.can_issue(cmd.op, banks, cmd.bytes):
+                    pending.pop(cid)
+                    latency = self._issue_command(cmd)
+                    if latency > 0:
+                        self.resource.reserve(cmd.op, banks, cmd.bytes, latency)
+                        heapq.heappush(self.event_queue, (self.cycle + latency, cid))
+                    else:
+                        self.completed.add(cid)
+                    issued_this_cycle = True
                 else:
-                    self.completed.add(cid)
+                    resource_stalled.append(cid)
+
+            # Count stall cycles: any cycle where at least one command is blocked by resources
+            if resource_stalled:
+                self.latency_breakdown["bank_conflict_stall_cycles"] += 1
 
             # Add leakage for this cycle
             self.energy.add_leakage(1)
