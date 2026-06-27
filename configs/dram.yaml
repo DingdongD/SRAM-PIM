@@ -1,0 +1,12 @@
+dram:
+  model: analytical
+  type: LPDDR4
+  channels: 1
+  bus_width_bits: 64
+  burst_bytes: 64
+  effective_bandwidth_gbps: 25.6
+  fixed_latency_ns: 80
+  energy:
+    read_pj_per_byte: 15.0
+    write_pj_per_byte: 18.0
+    io_pj_per_byte: 8.0

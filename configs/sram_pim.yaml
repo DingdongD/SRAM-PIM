@@ -1,0 +1,36 @@
+sram_pim:
+  tiles: 16
+  banks_per_tile: 32
+  bank_capacity_kb: 8
+  total_capacity_kb: 4096
+  word_bytes: 16
+
+  port_model:
+    read_ports_per_bank: 1
+    write_ports_per_bank: 1
+    pim_ports_per_bank: 1
+    pim_exclusive_with_read: true
+    pim_exclusive_with_write: true
+
+  pim:
+    mode: digital_near_sram
+    lanes_per_bank: 128
+    mac_latency_cycles: 2
+    mac_issue_interval_cycles: 1
+    reduce_latency_cycles: 4
+    nonlinear_latency_cycles: 4
+    max_parallel_banks: 16
+    power_throttle: true
+    tile_power_budget_mw: 100
+
+  buffers:
+    input_buffer_kb_per_tile: 16
+    psum_buffer_kb_per_tile: 32
+    output_buffer_kb_per_tile: 16
+    double_buffering: true
+
+  power_state:
+    allow_clock_gating: true
+    allow_power_gating: false
+    wakeup_latency_cycles: 20
+    wakeup_energy_pj: 500

@@ -1,0 +1,19 @@
+energy:
+  sram:
+    source: analytical
+    read_pj_per_access: 3.2
+    write_pj_per_access: 3.8
+    leakage_mw_per_bank: 0.39
+
+  pim:
+    mac_pj_per_op: 0.08
+    reduce_pj_per_op: 0.04
+    nonlinear_pj_per_elem: 0.12
+    control_pj_per_command: 1.0
+
+  noc:
+    pj_per_byte_per_hop: 0.2
+    average_hops: 2
+
+  dma:
+    pj_per_byte: 0.5

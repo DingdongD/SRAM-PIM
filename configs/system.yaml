@@ -1,0 +1,14 @@
+system:
+  frequency_hz: 1000000000
+  mode: warm_resident
+  num_queries_for_amortization: 1000
+  count_initial_preload: false
+  count_final_writeback: true
+
+workload:
+  model: GEMM_test
+  batch_size: 1
+  precision:
+    activation: int8
+    weight: int8
+    psum: int32
