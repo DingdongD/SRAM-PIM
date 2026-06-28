@@ -34,5 +34,7 @@ def generate_report(result: dict, config: SimConfig) -> str:
         "pim": result["pim"],
         "correctness": result["correctness"],
         "valid_simulation": result.get("valid_simulation", False),
+        "final_state": result.get("final_state", {}),
+        "model_provenance": result.get("model_provenance", {}),
     }
     return yaml.dump(report, default_flow_style=False, sort_keys=False)

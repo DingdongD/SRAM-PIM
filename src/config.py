@@ -25,6 +25,11 @@ class SystemConfig:
     count_initial_preload: bool = False
     count_final_writeback: bool = True
     correctness_mode: str = "strict"  # strict | warn | auto_reload
+    final_dirty_policy: str = "report"  # error | auto_writeback | report | ignore
+    persistent_object_types: list = field(
+        default_factory=lambda: ["OUTPUT", "STATE", "META", "DIST"]
+    )
+    spill_model: str = "blocking"  # blocking | event_level
 
 
 @dataclass
