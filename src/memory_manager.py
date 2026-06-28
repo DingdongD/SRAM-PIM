@@ -103,19 +103,30 @@ class MemoryManager:
     def get_free_bytes(self, tile: int) -> int:
         return self.tile_capacity[tile] - self.tile_usage[tile]
 
-    def find_eviction_candidate(self, tile: int, needed_bytes: int) -> list:
+    def find_eviction_candidate(self, tile: int, needed_bytes: int,
+                                target_banks: list = None,
+                                protected_ids: set = None) -> list:
+        if protected_ids is None:
+            protected_ids = set()
         candidates = []
         freed = 0
         resident = [
             oid for oid, obj in self.objects.items()
-            if obj.valid_in_sram and obj.sram_tile == tile and not obj.pinned
+            if obj.valid_in_sram and obj.sram_tile == tile
+            and not obj.pinned and oid not in protected_ids
         ]
+
+        target_bank_set = set(target_banks) if target_banks else set()
 
         def evict_priority(oid):
             obj = self.objects[oid]
-            type_pri = 0 if obj.obj_type == ObjType.ACTIVATION else 1
+            # Prefer objects overlapping target banks (higher overlap = evict first)
+            bank_overlap = len(set(obj.sram_banks) & target_bank_set) if target_bank_set else 0
+            overlap_pri = -bank_overlap  # negative so higher overlap sorts first
             dirty_pri = 0 if not obj.dirty_in_sram else 1
-            return (dirty_pri, type_pri)
+            type_pri = 0 if obj.obj_type in (ObjType.ACTIVATION, ObjType.PSUM) else 1
+            size_pri = -obj.bytes  # prefer larger objects
+            return (overlap_pri, dirty_pri, type_pri, size_pri)
 
         resident.sort(key=evict_priority)
         for oid in resident:

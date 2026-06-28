@@ -249,6 +249,12 @@ class Simulator:
         self.latency_breakdown["dram_store_cycles"] += lat
         return lat
 
+    def _get_protected_ids(self, cmd: TraceCommand) -> set:
+        """Get object IDs that must not be evicted during this command."""
+        ids = set(parse_src_ids(cmd.src))
+        ids.add(cmd.object_id)
+        return ids
+
     def _issue_pim_mac(self, cmd: TraceCommand) -> int:
         reload_lat = self._ensure_inputs_ready(cmd)
         mac_count = cmd.attrs.get("mac_count", 0)
@@ -257,7 +263,7 @@ class Simulator:
         active_banks = max(1, len(output_banks))
         effective_lanes = active_banks * self.config.sram_pim.pim.lanes_per_bank
         compute_steps = ceil_div(mac_count, effective_lanes) if mac_count > 0 else 1
-        lat = max(
+        compute_lat = max(
             self.config.sram_pim.pim.mac_latency_cycles,
             compute_steps * self.config.sram_pim.pim.mac_issue_interval_cycles
         )
@@ -265,15 +271,15 @@ class Simulator:
         self._account_pim_data_energy(cmd, mac_count)
         self.energy.add_pim_mac(mac_count)
 
-        # P0-A: _ensure_output_object returns extra alloc/spill latency
-        alloc_lat = self._ensure_output_object(cmd, ObjType.PSUM, "int32")
-        lat += alloc_lat + reload_lat
+        alloc_lat = self._ensure_output_object(
+            cmd, ObjType.PSUM, "int32",
+            protected_ids=self._get_protected_ids(cmd))
 
         obj = self.mem_mgr.objects[cmd.object_id]
         obj.begin_producing()
 
-        self.latency_breakdown["pim_compute_cycles"] += lat
-        return lat
+        self.latency_breakdown["pim_compute_cycles"] += compute_lat
+        return compute_lat + alloc_lat + reload_lat
 
     def _issue_pim_ew(self, cmd: TraceCommand) -> int:
         reload_lat = self._ensure_inputs_ready(cmd)
@@ -281,55 +287,57 @@ class Simulator:
 
         active_banks = max(1, len(self._get_output_banks(cmd)))
         effective_lanes = active_banks * self.config.sram_pim.pim.lanes_per_bank
-        lat = max(1, ceil_div(count, effective_lanes))
+        compute_lat = max(1, ceil_div(count, effective_lanes))
 
         self._account_pim_data_energy(cmd, count)
         self.energy.add_pim_ew(count)
 
-        # P0-D: Use attrs for output type/precision
         out_type = _obj_type_from_str(cmd.attrs.get("out_type", "ACTIVATION"))
         out_prec = cmd.attrs.get("out_precision", "int8")
-        alloc_lat = self._ensure_output_object(cmd, out_type, out_prec)
-        lat += alloc_lat + reload_lat
+        alloc_lat = self._ensure_output_object(
+            cmd, out_type, out_prec,
+            protected_ids=self._get_protected_ids(cmd))
 
         obj = self.mem_mgr.objects[cmd.object_id]
         obj.begin_producing()
 
-        self.latency_breakdown["pim_compute_cycles"] += lat
-        return lat
+        self.latency_breakdown["pim_compute_cycles"] += compute_lat
+        return compute_lat + alloc_lat + reload_lat
 
     def _issue_pim_reduce(self, cmd: TraceCommand) -> int:
         reload_lat = self._ensure_inputs_ready(cmd)
         count = cmd.attrs.get("count", 0)
-        lat = self.config.sram_pim.pim.reduce_latency_cycles
+        compute_lat = self.config.sram_pim.pim.reduce_latency_cycles
         self.energy.add_pim_reduce(count)
 
         out_type = _obj_type_from_str(cmd.attrs.get("out_type", "PSUM"))
         out_prec = cmd.attrs.get("out_precision", "int32")
-        alloc_lat = self._ensure_output_object(cmd, out_type, out_prec)
-        lat += alloc_lat + reload_lat
+        alloc_lat = self._ensure_output_object(
+            cmd, out_type, out_prec,
+            protected_ids=self._get_protected_ids(cmd))
 
         obj = self.mem_mgr.objects[cmd.object_id]
         obj.begin_producing()
 
-        self.latency_breakdown["pim_reduce_cycles"] += lat
-        return lat
+        self.latency_breakdown["pim_reduce_cycles"] += compute_lat
+        return compute_lat + alloc_lat + reload_lat
 
     def _issue_pim_nl(self, cmd: TraceCommand) -> int:
         reload_lat = self._ensure_inputs_ready(cmd)
         count = cmd.attrs.get("count", 0)
-        lat = self.config.sram_pim.pim.nonlinear_latency_cycles
+        compute_lat = self.config.sram_pim.pim.nonlinear_latency_cycles
         self.energy.add_pim_nl(count)
 
         out_type = _obj_type_from_str(cmd.attrs.get("out_type", "ACTIVATION"))
         out_prec = cmd.attrs.get("out_precision", "int8")
-        alloc_lat = self._ensure_output_object(cmd, out_type, out_prec)
-        lat += alloc_lat + reload_lat
+        alloc_lat = self._ensure_output_object(
+            cmd, out_type, out_prec,
+            protected_ids=self._get_protected_ids(cmd))
 
         obj = self.mem_mgr.objects[cmd.object_id]
         obj.begin_producing()
 
-        return lat
+        return compute_lat + alloc_lat + reload_lat
 
     def _issue_pim_writeback(self, cmd: TraceCommand) -> int:
         obj = self.mem_mgr.objects.get(cmd.object_id)
@@ -411,7 +419,8 @@ class Simulator:
     # ------------------------------------------------------------------ #
     def _ensure_output_object(self, cmd: TraceCommand,
                               default_type: ObjType,
-                              default_precision: str) -> int:
+                              default_precision: str,
+                              protected_ids: set = None) -> int:
         extra_lat = 0
 
         # P0-D: Resolve output metadata from attrs
@@ -446,7 +455,8 @@ class Simulator:
                 cmd.object_id, loc.tile, list(loc.banks), make_valid=False)
             if not ok:
                 extra_lat += self._allocate_or_spill(
-                    cmd.object_id, loc.tile, list(loc.banks))
+                    cmd.object_id, loc.tile, list(loc.banks),
+                    protected_ids=protected_ids)
         else:
             # Tile consistency check: if already placed, dst must match
             if cmd.dst and cmd.dst.startswith("SRAM:"):
@@ -481,12 +491,14 @@ class Simulator:
     # Spill / writeback / reload helpers
     # ------------------------------------------------------------------ #
     def _allocate_or_spill(self, object_id: str, tile: int,
-                           banks: list) -> int:
+                           banks: list,
+                           protected_ids: set = None) -> int:
         obj = self.mem_mgr.objects[object_id]
         needed = obj.bytes - self.mem_mgr.get_free_bytes(tile)
         if needed <= 0:
             needed = obj.bytes
-        victims = self.mem_mgr.find_eviction_candidate(tile, needed)
+        victims = self.mem_mgr.find_eviction_candidate(
+            tile, needed, target_banks=banks, protected_ids=protected_ids)
 
         if not victims:
             self.correctness["capacity_overcommit_events"] += 1
@@ -524,22 +536,27 @@ class Simulator:
         """Dispatch writeback to blocking or event-level model."""
         if self.config.system.spill_model == "event_level":
             return self._event_level_writeback(victim)
-        return self._blocking_writeback(victim)
+        return self._blocking_writeback(victim, reason="spill")
 
-    def _blocking_writeback(self, obj: MemoryObject) -> int:
+    def _blocking_writeback(self, obj: MemoryObject,
+                            reason: str = "spill") -> int:
         lat = self.dram.get_write_latency(obj.bytes)
         self.energy.add_dram_write(obj.bytes)
         self.energy.add_noc(obj.bytes)
         n_accesses = ceil_div(obj.bytes, self.config.sram_pim.word_bytes)
         self.energy.add_sram_read(n_accesses)
         obj.writeback_complete()
-        self.mem_mgr.stats["spill_count"] += 1
+        if reason == "spill":
+            self.mem_mgr.stats["spill_count"] += 1
+        elif reason == "final":
+            self.mem_mgr.stats.setdefault("final_writeback_count", 0)
+            self.mem_mgr.stats["final_writeback_count"] += 1
         return lat
 
     def _event_level_writeback(self, victim: MemoryObject) -> int:
-        """Event-level writeback: same accounting as blocking for now,
-        but goes through DMA issue path for consistent resource tracking."""
-        # First version: blocking wait but through unified path
+        """Event-level writeback stub: same accounting as blocking for now,
+        but goes through DMA issue path for consistent resource tracking.
+        NOTE: True event-level would enqueue internal DMA_STORE commands."""
         lat = self.dram.get_write_latency(victim.bytes)
         self.energy.add_dram_write(victim.bytes)
         self.energy.add_noc(victim.bytes)
@@ -686,9 +703,12 @@ class Simulator:
             total_lat = 0
             for item in self.final_dirty_objects:
                 obj = self.mem_mgr.objects[item["object_id"]]
-                lat = self._blocking_writeback(obj)
+                lat = self._blocking_writeback(obj, reason="final")
                 total_lat += lat
             self.latency_breakdown["final_writeback_cycles"] += total_lat
+            # Add leakage for the final writeback period
+            active = self.mem_mgr.count_active_banks()
+            self.energy.add_leakage(total_lat, active_banks=active)
             self.cycle += total_lat
             self.finalization_report["final_auto_writeback_cycles"] = total_lat
             self.finalization_report["final_dirty_after_policy"] = 0
@@ -778,11 +798,21 @@ class Simulator:
     # ------------------------------------------------------------------ #
     # Report generation
     # ------------------------------------------------------------------ #
+    def _compute_valid_simulation(self) -> bool:
+        counters = dict(self.correctness)
+        mode = self.config.system.correctness_mode
+        # In auto_reload mode, unresident input events are legal cache misses
+        if mode == "auto_reload":
+            counters.pop("illegal_read_unresident_object", None)
+        finalization_ok = getattr(self, "finalization_report", {}).get(
+            "final_dirty_after_policy", 0) == 0
+        return all(v == 0 for v in counters.values()) and finalization_ok
+
     def _make_report(self) -> dict:
         eb = self.energy.get_breakdown()
         freq = self.config.system.frequency_hz
         total_ns = self.cycle * 1e9 / freq
-        valid = all(v == 0 for v in self.correctness.values())
+        valid = self._compute_valid_simulation()
 
         return {
             "latency": {
@@ -804,6 +834,7 @@ class Simulator:
                 "spill_count": self.mem_mgr.stats["spill_count"],
                 "eviction_count": self.mem_mgr.stats["eviction_count"],
                 "writeback_count": self.mem_mgr.stats["writeback_count"],
+                "final_writeback_count": self.mem_mgr.stats.get("final_writeback_count", 0),
                 "reload_count": self.mem_mgr.stats["reload_count"],
             },
             "pim": {
@@ -825,7 +856,7 @@ class Simulator:
                 "timing_fidelity": (
                     "architectural_blocking_spill"
                     if self.config.system.spill_model == "blocking"
-                    else "architectural_event_level_spill"
+                    else "blocking_writeback_with_event_level_interface"
                 ),
                 "dram_model": self.config.dram.model,
                 "sram_param_source": self.config.energy.sram.source,
