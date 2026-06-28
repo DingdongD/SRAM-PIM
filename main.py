@@ -3,6 +3,7 @@ import sys
 
 from src.config import load_config
 from src.tracegen.gen_gemm_trace import gen_gemm_trace
+from src.tracegen.gen_attention_trace import gen_attention_trace
 from src.simulator import Simulator
 from src.report import generate_report
 
@@ -20,6 +21,12 @@ def main():
     parser.add_argument("--mode", type=str, default=None,
                         help="Override: cold_start|warm_resident|amortized")
     parser.add_argument("--output", type=str, default=None, help="Output YAML file")
+    # Attention-specific arguments
+    parser.add_argument("--num-heads", type=int, default=8, help="Number of attention heads")
+    parser.add_argument("--d-head", type=int, default=64, help="Dimension per attention head")
+    parser.add_argument("--seq-len", type=int, default=128, help="Sequence length")
+    parser.add_argument("--stage", type=str, default="generation",
+                        help="Attention stage: generation (decode) or summarization (prefill)")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -31,6 +38,17 @@ def main():
             Tm=args.Tm, Tn=args.Tn, Tk=args.Tk,
             sram_config=config.sram_pim,
             mode=mode,
+        )
+    elif args.workload == "attention":
+        cmds = gen_attention_trace(
+            batch=config.workload.batch_size,
+            seq_len=args.seq_len,
+            num_heads=args.num_heads,
+            d_head=args.d_head,
+            sram_config=config.sram_pim,
+            precision=config.workload.precision.activation,
+            mode=mode,
+            stage=args.stage,
         )
     else:
         print(f"Unknown workload: {args.workload}", file=sys.stderr)
