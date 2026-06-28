@@ -18,10 +18,13 @@ class EnergyModel:
             "sram_read_count": 0,
             "sram_write_count": 0,
             "pim_mac_count": 0,
+            "pim_ew_count": 0,
             "pim_reduce_count": 0,
             "pim_nl_count": 0,
             "noc_bytes": 0,
             "leakage_cycles": 0,
+            "leakage_active_bank_cycles": 0,
+            "leakage_gated_bank_cycles": 0,
             "command_count": 0,
         }
 
@@ -43,6 +46,9 @@ class EnergyModel:
     def add_pim_mac(self, count: int):
         self._counters["pim_mac_count"] += count
 
+    def add_pim_ew(self, count: int):
+        self._counters["pim_ew_count"] += count
+
     def add_pim_reduce(self, count: int):
         self._counters["pim_reduce_count"] += count
 
@@ -52,8 +58,14 @@ class EnergyModel:
     def add_noc(self, nbytes: int):
         self._counters["noc_bytes"] += nbytes
 
-    def add_leakage(self, cycles: int):
+    def add_leakage(self, cycles: int, active_banks: int = -1,
+                    gated_banks: int = 0):
+        """Add leakage energy. If active_banks < 0, assume all banks active."""
         self._counters["leakage_cycles"] += cycles
+        if active_banks < 0:
+            active_banks = self.total_banks
+        self._counters["leakage_active_bank_cycles"] += active_banks * cycles
+        self._counters["leakage_gated_bank_cycles"] += gated_banks * cycles
 
     def add_command(self):
         self._counters["command_count"] += 1
@@ -69,11 +81,18 @@ class EnergyModel:
         sram_read = c["sram_read_count"] * ec.sram.read_pj_per_access
         sram_write = c["sram_write_count"] * ec.sram.write_pj_per_access
 
-        # Leakage: P_leak(W) * time(s) -> J -> pJ
-        time_s = c["leakage_cycles"] / self.freq_hz
-        leak_pj = self.total_banks * ec.sram.leakage_mw_per_bank * 1e-3 * time_s * 1e12
+        # Leakage: use per-bank-cycle tracking if available, else fallback
+        if c["leakage_active_bank_cycles"] > 0:
+            time_s_per_bank_cycle = 1.0 / self.freq_hz
+            leak_pj = (c["leakage_active_bank_cycles"] *
+                       ec.sram.leakage_mw_per_bank * 1e-3 *
+                       time_s_per_bank_cycle * 1e12)
+        else:
+            time_s = c["leakage_cycles"] / self.freq_hz
+            leak_pj = self.total_banks * ec.sram.leakage_mw_per_bank * 1e-3 * time_s * 1e12
 
         pim_mac = c["pim_mac_count"] * ec.pim.mac_pj_per_op
+        pim_ew = c["pim_ew_count"] * ec.pim.ew_pj_per_op
         pim_reduce = c["pim_reduce_count"] * ec.pim.reduce_pj_per_op
         pim_nl = c["pim_nl_count"] * ec.pim.nonlinear_pj_per_elem
         noc = c["noc_bytes"] * ec.noc.pj_per_byte_per_hop * ec.noc.average_hops
@@ -81,7 +100,8 @@ class EnergyModel:
         control = c["command_count"] * ec.pim.control_pj_per_command
 
         total = (dram_read + dram_write + io + sram_read + sram_write +
-                 leak_pj + pim_mac + pim_reduce + pim_nl + noc + dma + control)
+                 leak_pj + pim_mac + pim_ew + pim_reduce + pim_nl +
+                 noc + dma + control)
 
         return {
             "dram_read_pj": dram_read,
@@ -92,6 +112,7 @@ class EnergyModel:
             "sram_write_pj": sram_write,
             "sram_leakage_pj": leak_pj,
             "pim_mac_pj": pim_mac,
+            "pim_ew_pj": pim_ew,
             "pim_reduce_pj": pim_reduce,
             "pim_nl_pj": pim_nl,
             "noc_pj": noc,

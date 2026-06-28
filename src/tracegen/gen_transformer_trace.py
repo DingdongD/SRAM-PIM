@@ -62,6 +62,12 @@ def gen_transformer_trace(model_config: dict, sram_config: SRAMPIMConfig,
         attn_id_map: dict[int, int] = {}
         # Collect all object_ids so we can rename src references too
         attn_obj_ids = {c.object_id for c in attn_cmds}
+        for c in attn_cmds:
+            for tok in c.src.split(","):
+                tok = tok.strip()
+                if (tok and tok != "-" and not tok.startswith("SRAM:")
+                        and not tok.startswith("DRAM:")):
+                    attn_obj_ids.add(tok)
         attn_obj_rename = {oid: f"L{layer}_{oid}" for oid in attn_obj_ids}
 
         for c in attn_cmds:
@@ -102,11 +108,13 @@ def gen_transformer_trace(model_config: dict, sram_config: SRAMPIMConfig,
         ffn_id_map: dict[int, int] = {}
         ffn_prefix = f"L{layer}_FFN_"
         # Collect all object names from both object_id fields AND src references
+        # Filter out SRAM/DRAM location strings which are not object IDs
         ffn_obj_ids = {c.object_id for c in ffn_cmds}
         for c in ffn_cmds:
             for tok in c.src.split(","):
                 tok = tok.strip()
-                if tok and tok != "-":
+                if (tok and tok != "-" and not tok.startswith("SRAM:")
+                        and not tok.startswith("DRAM:")):
                     ffn_obj_ids.add(tok)
         ffn_obj_rename = {oid: f"{ffn_prefix}{oid}" for oid in ffn_obj_ids}
 

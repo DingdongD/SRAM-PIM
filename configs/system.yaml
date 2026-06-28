@@ -4,6 +4,7 @@ system:
   num_queries_for_amortization: 1000
   count_initial_preload: false
   count_final_writeback: true
+  correctness_mode: strict
 
 workload:
   model: GEMM_test

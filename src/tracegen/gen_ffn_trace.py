@@ -38,15 +38,21 @@ def gen_ffn_trace(batch: int, seq_len: int, d_model: int, d_ff: int,
     # Determine the next available cmd_id after up_cmds
     max_id = max(c.cmd_id for c in up_cmds) + 1
 
-    # Find the last PIM_MAC in the up-projection to depend the activation on
-    last_up_mac = max(c.cmd_id for c in up_cmds if c.op == OpCode.PIM_MAC)
+    # Collect ALL up-projection PIM_MAC cmd_ids — the NL must wait for every
+    # Y tile to be fully produced before applying activation element-wise.
+    all_up_mac_ids = [c.cmd_id for c in up_cmds if c.op == OpCode.PIM_MAC]
+
+    # Build a comma-separated src referencing all Y tiles from the up-projection
+    up_y_ids = sorted({c.object_id for c in up_cmds
+                       if c.op == OpCode.PIM_MAC})
+    nl_src = ",".join(up_y_ids) if up_y_ids else "Y_m0_n0"
 
     # --- Activation (GeLU/SiLU) applied element-wise to H ---
     nl_count = M * d_ff
     nl_cmd = TraceCommand(max_id, OpCode.PIM_NL, "FFN_act",
-                          "Y_m0_n0", "SRAM:T0:B0-1",
+                          nl_src, "SRAM:T0:B0-1",
                           0, {"count": nl_count, "op": "gelu"},
-                          [last_up_mac])
+                          all_up_mac_ids)
     max_id += 1
 
     # --- Down-projection: H[M, d_ff] @ W2[d_ff, d_model] -> O[M, d_model] ---

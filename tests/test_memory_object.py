@@ -36,11 +36,18 @@ def test_memory_object_evict_clean():
 
 
 def test_memory_object_evict_dirty():
+    """Dirty object cannot be evicted without writeback — must raise."""
+    import pytest
     obj = MemoryObject("P0", ObjType.PSUM, 1024, "int32")
     obj.load_to_sram(0, [0])
     obj.mark_dirty()
-    needs_writeback = obj.evict()
-    assert needs_writeback is True
+    with pytest.raises(RuntimeError, match="Cannot evict dirty"):
+        obj.evict()
+    # After writeback, evict should succeed
+    obj.writeback_complete()
+    result = obj.evict()
+    assert result is False
+    assert obj.valid_in_sram is False
 
 
 def test_memory_object_pinned_cannot_evict():

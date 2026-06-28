@@ -1,6 +1,8 @@
 import pytest
 from src.memory_manager import MemoryManager
-from src.memory_object import MemoryObject, ObjType
+from src.memory_object import MemoryObject, ObjType, ObjState
+
+
 from src.config import SRAMPIMConfig
 
 
@@ -9,17 +11,29 @@ def make_config():
 
 
 def test_allocate_object():
+    """Allocate reserves space but does NOT make data valid (P0-01)."""
     mgr = MemoryManager(make_config())
     obj = MemoryObject("W0", ObjType.WEIGHT, 8192, "int8")
     mgr.register_object(obj)
     ok = mgr.allocate("W0", sram_tile=0, sram_banks=[0, 1])
     assert ok is True
+    assert mgr.get_object("W0").valid_in_sram is False
+    assert mgr.get_object("W0").state == ObjState.SRAM_RESERVED
+
+
+def test_allocate_make_valid():
+    """Allocate with make_valid=True for preloaded objects."""
+    mgr = MemoryManager(make_config())
+    obj = MemoryObject("W0", ObjType.WEIGHT, 8192, "int8")
+    mgr.register_object(obj)
+    ok = mgr.allocate("W0", sram_tile=0, sram_banks=[0, 1], make_valid=True)
+    assert ok is True
     assert mgr.get_object("W0").valid_in_sram is True
+    assert mgr.get_object("W0").state == ObjState.VALID_CLEAN
 
 
 def test_allocate_exceeds_capacity():
     mgr = MemoryManager(make_config())
-    # tile has 4 banks * 8KB = 32KB
     obj = MemoryObject("big", ObjType.ACTIVATION, 33 * 1024, "int8")
     mgr.register_object(obj)
     ok = mgr.allocate("big", sram_tile=0, sram_banks=[0, 1, 2, 3])
@@ -52,19 +66,24 @@ def test_eviction_candidate():
     obj2 = MemoryObject("W0", ObjType.WEIGHT, 4096, "int8", pinned=True)
     mgr.register_object(obj1)
     mgr.register_object(obj2)
-    mgr.allocate("X0", 0, [0])
-    mgr.allocate("W0", 0, [1])
+    # Must make objects valid for them to be eviction candidates
+    mgr.allocate("X0", 0, [0], make_valid=True)
+    mgr.allocate("W0", 0, [1], make_valid=True)
     candidates = mgr.find_eviction_candidate(tile=0, needed_bytes=4096)
     assert "X0" in candidates
     assert "W0" not in candidates
 
 
-def test_read_unresident_raises():
+def test_bank_capacity_overflow():
+    """P1-10: Bank-level capacity should be checked."""
     mgr = MemoryManager(make_config())
-    obj = MemoryObject("X0", ObjType.ACTIVATION, 4096, "int8")
-    mgr.register_object(obj)
-    with pytest.raises(RuntimeError):
-        mgr.check_valid_for_read("X0")
+    # Bank capacity = 8KB. Two 6KB objects on same bank should fail.
+    obj1 = MemoryObject("X0", ObjType.ACTIVATION, 6000, "int8")
+    obj2 = MemoryObject("X1", ObjType.ACTIVATION, 6000, "int8")
+    mgr.register_object(obj1)
+    mgr.register_object(obj2)
+    assert mgr.allocate("X0", 0, [0]) is True
+    assert mgr.allocate("X1", 0, [0]) is False
 
 
 def test_stats_tracking():

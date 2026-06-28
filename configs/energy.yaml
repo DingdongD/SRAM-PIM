@@ -7,6 +7,7 @@ energy:
 
   pim:
     mac_pj_per_op: 0.08
+    ew_pj_per_op: 0.03
     reduce_pj_per_op: 0.04
     nonlinear_pj_per_elem: 0.12
     control_pj_per_command: 1.0

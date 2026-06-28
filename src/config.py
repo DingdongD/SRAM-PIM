@@ -24,6 +24,7 @@ class SystemConfig:
     num_queries_for_amortization: int = 1000
     count_initial_preload: bool = False
     count_final_writeback: bool = True
+    correctness_mode: str = "strict"  # strict | warn | auto_reload
 
 
 @dataclass
@@ -65,6 +66,8 @@ class PIMHardwareConfig:
     max_parallel_banks: int = 16
     power_throttle: bool = True
     tile_power_budget_mw: float = 100.0
+    nonlinear_units_per_tile: int = 1
+    nonlinear_issue_interval_cycles: int = 1
 
 
 @dataclass
@@ -107,6 +110,7 @@ class SRAMEnergyConfig:
 @dataclass
 class PIMEnergyConfig:
     mac_pj_per_op: float = 0.08
+    ew_pj_per_op: float = 0.03
     reduce_pj_per_op: float = 0.04
     nonlinear_pj_per_elem: float = 0.12
     control_pj_per_command: float = 1.0

@@ -1,24 +1,14 @@
 import heapq
+from dataclasses import dataclass, field
 from src.config import SimConfig
 from src.trace_ir import TraceCommand, OpCode
-from src.memory_object import MemoryObject, ObjType
+from src.memory_object import MemoryObject, ObjType, ObjState
 from src.memory_manager import MemoryManager
 from src.dram_model import DRAMModel
 from src.energy_model import EnergyModel
 from src.resource_model import ResourceModel
-
-
-def _parse_sram_loc(loc_str: str):
-    """Parse 'SRAM:T0:B0-3' -> (tile=0, banks=[0,1,2,3])"""
-    parts = loc_str.split(":")
-    tile = int(parts[1][1:])
-    bank_str = parts[2][1:]
-    if "-" in bank_str:
-        lo, hi = bank_str.split("-")
-        banks = list(range(int(lo), int(hi) + 1))
-    else:
-        banks = [int(b) for b in bank_str.split(",")]
-    return tile, banks
+from src.utils.math_utils import ceil_div
+from src.utils.location import parse_sram_loc, global_bank_ids, parse_src_ids
 
 
 def _obj_type_from_str(s: str) -> ObjType:
@@ -31,6 +21,13 @@ def _obj_type_from_str(s: str) -> ObjType:
     return mapping.get(s, ObjType.ACTIVATION)
 
 
+@dataclass(order=True)
+class Event:
+    finish_cycle: int
+    cmd_id: int
+    cmd: TraceCommand = field(compare=False)
+
+
 class Simulator:
     def __init__(self, config: SimConfig):
         self.config = config
@@ -39,10 +36,11 @@ class Simulator:
         self.energy = EnergyModel(config.energy, config.sram_pim,
                                   config.dram, config.system.frequency_hz)
         self.resource = ResourceModel(config.sram_pim)
+        self.strict = config.system.correctness_mode == "strict"
         self.cycle = 0
         self.commands = []
         self.completed = set()
-        self.event_queue = []  # (finish_cycle, cmd_id)
+        self.event_queue: list[Event] = []
         self.latency_breakdown = {
             "dram_load_cycles": 0,
             "dram_store_cycles": 0,
@@ -50,12 +48,16 @@ class Simulator:
             "pim_reduce_cycles": 0,
             "stall_dependency_cycles": 0,
             "bank_conflict_stall_cycles": 0,
+            "spill_writeback_cycles": 0,
         }
         self.correctness = {
             "illegal_read_unresident_object": 0,
+            "missing_input_object": 0,
+            "illegal_read_power_gated_object": 0,
             "illegal_evict_dirty_without_writeback": 0,
             "capacity_overcommit_events": 0,
             "dependency_violations": 0,
+            "deadlock_events": 0,
         }
 
     def load_trace(self, commands: list):
@@ -64,24 +66,85 @@ class Simulator:
     def _deps_ready(self, cmd: TraceCommand) -> bool:
         return all(d in self.completed for d in cmd.deps)
 
+    # P0-08: Get banks from actual object positions, not just trace strings
+    def _banks_of_object(self, oid: str) -> list:
+        obj = self.mem_mgr.objects.get(oid)
+        if obj is None or obj.sram_tile < 0:
+            return []
+        bpt = self.config.sram_pim.banks_per_tile
+        return [obj.sram_tile * bpt + b for b in obj.sram_banks]
+
     def _get_banks(self, cmd: TraceCommand) -> list:
-        """Extract bank indices from a command for resource tracking."""
-        # Explicit banks list in attrs takes priority
+        """Extract bank indices using object actual positions (P0-08)."""
         if "banks" in cmd.attrs:
             return list(cmd.attrs["banks"])
-        # Parse from dst location if it's an SRAM location
-        loc = cmd.dst if cmd.dst and cmd.dst.startswith("SRAM:") else (
-            cmd.src if cmd.src and cmd.src.startswith("SRAM:") else None
-        )
-        if loc:
-            try:
-                tile, local_banks = _parse_sram_loc(loc)
-                banks_per_tile = self.config.sram_pim.banks_per_tile
-                return [tile * banks_per_tile + b for b in local_banks]
-            except Exception:
-                pass
+
+        banks = set()
+        bpt = self.config.sram_pim.banks_per_tile
+
+        if cmd.op in {OpCode.PIM_MAC, OpCode.PIM_EW_OP, OpCode.PIM_REDUCE,
+                      OpCode.PIM_NL}:
+            # Input banks
+            for iid in parse_src_ids(cmd.src):
+                if iid in self.mem_mgr.objects:
+                    banks.update(self._banks_of_object(iid))
+            # Output banks
+            if cmd.object_id in self.mem_mgr.objects:
+                banks.update(self._banks_of_object(cmd.object_id))
+            elif cmd.dst and cmd.dst.startswith("SRAM:"):
+                loc = parse_sram_loc(cmd.dst)
+                banks.update(global_bank_ids(loc, bpt))
+            return sorted(banks)
+
+        if cmd.op == OpCode.DMA_LOAD:
+            if cmd.dst and cmd.dst.startswith("SRAM:"):
+                loc = parse_sram_loc(cmd.dst)
+                return global_bank_ids(loc, bpt)
+            if cmd.object_id in self.mem_mgr.objects:
+                return self._banks_of_object(cmd.object_id)
+
+        if cmd.op == OpCode.DMA_STORE:
+            if cmd.object_id in self.mem_mgr.objects:
+                return self._banks_of_object(cmd.object_id)
+            if cmd.src and cmd.src.startswith("SRAM:"):
+                loc = parse_sram_loc(cmd.src)
+                return global_bank_ids(loc, bpt)
+
+        # Fallback: try dst then src
+        for loc_str in [cmd.dst, cmd.src]:
+            if loc_str and loc_str.startswith("SRAM:"):
+                try:
+                    loc = parse_sram_loc(loc_str)
+                    return global_bank_ids(loc, bpt)
+                except Exception:
+                    pass
         return []
 
+    # P0-02: Strict input validation — raises on invalid inputs
+    def _require_inputs_valid(self, cmd: TraceCommand) -> None:
+        input_ids = parse_src_ids(cmd.src)
+        for iid in input_ids:
+            obj = self.mem_mgr.objects.get(iid)
+            if obj is None:
+                self.correctness["missing_input_object"] += 1
+                if self.strict:
+                    raise RuntimeError(
+                        f"cmd {cmd.cmd_id} ({cmd.op.value}): "
+                        f"missing input object '{iid}'")
+            elif not obj.valid_in_sram:
+                self.correctness["illegal_read_unresident_object"] += 1
+                if self.strict:
+                    raise RuntimeError(
+                        f"cmd {cmd.cmd_id} ({cmd.op.value}): "
+                        f"input '{iid}' not valid in SRAM (state={obj.state.value})")
+            elif obj.power_state != "active":
+                self.correctness["illegal_read_power_gated_object"] += 1
+                if self.strict:
+                    raise RuntimeError(
+                        f"cmd {cmd.cmd_id} ({cmd.op.value}): "
+                        f"input '{iid}' is {obj.power_state}")
+
+    # P0-03: Issue only sets pending state; completion commits state
     def _issue_command(self, cmd: TraceCommand) -> int:
         self.energy.add_command()
 
@@ -106,14 +169,17 @@ class Simulator:
         elif cmd.op == OpCode.PIM_WRITEBACK:
             return self._issue_pim_writeback(cmd)
         elif cmd.op == OpCode.POWER_SET:
-            return 0
+            return self._issue_power_set(cmd)
         return 0
 
+    # P0-01: Allocate reserves space but does NOT make data valid
     def _issue_alloc(self, cmd: TraceCommand) -> int:
-        tile, banks = _parse_sram_loc(cmd.dst)
+        loc = parse_sram_loc(cmd.dst)
+        tile, banks = loc.tile, list(loc.banks)
         obj_type_str = cmd.attrs.get("type", "ACTIVATION")
         pinned = bool(cmd.attrs.get("pinned", False))
         preloaded = bool(cmd.attrs.get("preloaded", False))
+
         obj = MemoryObject(
             object_id=cmd.object_id,
             obj_type=_obj_type_from_str(obj_type_str),
@@ -122,143 +188,308 @@ class Simulator:
             pinned=pinned,
         )
         self.mem_mgr.register_object(obj)
-        ok = self.mem_mgr.allocate(cmd.object_id, tile, banks)
+
+        # P0-04: Try allocate, spill if needed
+        ok = self.mem_mgr.allocate(cmd.object_id, tile, banks,
+                                   make_valid=preloaded)
         if not ok:
-            self.correctness["capacity_overcommit_events"] += 1
-        if preloaded:
-            obj.valid_in_sram = True
+            extra = self._allocate_or_spill(cmd.object_id, tile, banks)
+            if extra > 0:
+                self.latency_breakdown["spill_writeback_cycles"] += extra
+            if preloaded:
+                obj = self.mem_mgr.objects[cmd.object_id]
+                obj.valid_in_sram = True
+                obj.state = ObjState.VALID_CLEAN
+            return extra
         return 0
 
+    # P0-03: DMA_LOAD sets LOADING at issue, VALID_CLEAN at completion
     def _issue_dma_load(self, cmd: TraceCommand) -> int:
+        obj = self.mem_mgr.objects.get(cmd.object_id)
+        if obj:
+            obj.begin_loading()
         lat = self.dram.get_read_latency(cmd.bytes)
         self.energy.add_dram_read(cmd.bytes)
         self.energy.add_noc(cmd.bytes)
-        obj = self.mem_mgr.objects.get(cmd.object_id)
-        if obj:
-            obj.valid_in_sram = True
-            n_accesses = max(1, cmd.bytes // self.config.sram_pim.word_bytes)
-            self.energy.add_sram_write(n_accesses)
         self.latency_breakdown["dram_load_cycles"] += lat
         return lat
 
     def _issue_dma_store(self, cmd: TraceCommand) -> int:
+        obj = self.mem_mgr.objects.get(cmd.object_id)
+        if obj:
+            obj.begin_spilling()
         lat = self.dram.get_write_latency(cmd.bytes)
         self.energy.add_dram_write(cmd.bytes)
         self.energy.add_noc(cmd.bytes)
-        obj = self.mem_mgr.objects.get(cmd.object_id)
-        if obj:
-            n_accesses = max(1, cmd.bytes // self.config.sram_pim.word_bytes)
-            self.energy.add_sram_read(n_accesses)
-            obj.writeback_complete()
         self.latency_breakdown["dram_store_cycles"] += lat
         return lat
 
-    def _check_inputs_valid(self, cmd: TraceCommand) -> bool:
-        input_ids = [s.strip() for s in cmd.src.split(",") if s.strip() and s.strip() != "-"]
-        for iid in input_ids:
-            obj = self.mem_mgr.objects.get(iid)
-            if obj is None or not obj.valid_in_sram:
-                self.correctness["illegal_read_unresident_object"] += 1
-                return False
-        return True
-
     def _issue_pim_mac(self, cmd: TraceCommand) -> int:
-        self._check_inputs_valid(cmd)
+        self._require_inputs_valid(cmd)
         mac_count = cmd.attrs.get("mac_count", 0)
-        lat = self.config.sram_pim.pim.mac_latency_cycles
-        if mac_count > 0:
-            lat = max(lat, mac_count * self.config.sram_pim.pim.mac_issue_interval_cycles)
+
+        # P1-01: Compute latency based on effective lanes and active banks
+        output_banks = self._get_output_banks(cmd)
+        active_banks = max(1, len(output_banks))
+        effective_lanes = active_banks * self.config.sram_pim.pim.lanes_per_bank
+        compute_steps = ceil_div(mac_count, effective_lanes) if mac_count > 0 else 1
+        lat = max(
+            self.config.sram_pim.pim.mac_latency_cycles,
+            compute_steps * self.config.sram_pim.pim.mac_issue_interval_cycles
+        )
+
+        # P1-05: Account for SRAM read/write energy from data flow
+        self._account_pim_data_energy(cmd, mac_count)
         self.energy.add_pim_mac(mac_count)
-        # Create output object if not exists
-        if cmd.object_id not in self.mem_mgr.objects:
-            out_obj = MemoryObject(cmd.object_id, ObjType.PSUM, cmd.bytes or 1024, "int32")
-            self.mem_mgr.register_object(out_obj)
-            if cmd.dst.startswith("SRAM:"):
-                tile, banks = _parse_sram_loc(cmd.dst)
-                self.mem_mgr.allocate(cmd.object_id, tile, banks)
-            out_obj.valid_in_sram = True
-            out_obj.mark_dirty()
+
+        # Create output object if not exists (P0-06: valid_in_dram=False)
+        self._ensure_output_object(cmd, ObjType.PSUM, "int32")
+
+        # P0-03: Set PRODUCING, not VALID — completion will commit
+        obj = self.mem_mgr.objects[cmd.object_id]
+        obj.begin_producing()
+
         self.latency_breakdown["pim_compute_cycles"] += lat
         return lat
 
     def _issue_pim_ew(self, cmd: TraceCommand) -> int:
-        self._check_inputs_valid(cmd)
+        self._require_inputs_valid(cmd)
         count = cmd.attrs.get("count", 0)
-        lat = max(1, count // self.config.sram_pim.pim.lanes_per_bank)
-        self.energy.add_pim_mac(count)
+
+        active_banks = max(1, len(self._get_output_banks(cmd)))
+        effective_lanes = active_banks * self.config.sram_pim.pim.lanes_per_bank
+        lat = max(1, ceil_div(count, effective_lanes))
+
+        # P1-06: Use separate EW energy counter
+        self._account_pim_data_energy(cmd, count)
+        self.energy.add_pim_ew(count)
+
+        self._ensure_output_object(cmd, ObjType.PSUM, "int32")
+        obj = self.mem_mgr.objects[cmd.object_id]
+        obj.begin_producing()
+
         self.latency_breakdown["pim_compute_cycles"] += lat
         return lat
 
     def _issue_pim_reduce(self, cmd: TraceCommand) -> int:
-        self._check_inputs_valid(cmd)
+        self._require_inputs_valid(cmd)
         count = cmd.attrs.get("count", 0)
         lat = self.config.sram_pim.pim.reduce_latency_cycles
         self.energy.add_pim_reduce(count)
-        # Register output object so downstream commands can read it
-        if cmd.object_id not in self.mem_mgr.objects:
-            out_obj = MemoryObject(cmd.object_id, ObjType.PSUM, cmd.bytes or 1024, "int32")
-            self.mem_mgr.register_object(out_obj)
-            if cmd.dst and cmd.dst.startswith("SRAM:"):
-                tile, banks = _parse_sram_loc(cmd.dst)
-                self.mem_mgr.allocate(cmd.object_id, tile, banks)
-            out_obj.valid_in_sram = True
-        else:
-            obj = self.mem_mgr.objects[cmd.object_id]
-            obj.valid_in_sram = True
+
+        self._ensure_output_object(cmd, ObjType.PSUM, "int32")
+        obj = self.mem_mgr.objects[cmd.object_id]
+        obj.begin_producing()
+
         self.latency_breakdown["pim_reduce_cycles"] += lat
         return lat
 
     def _issue_pim_nl(self, cmd: TraceCommand) -> int:
-        self._check_inputs_valid(cmd)
+        self._require_inputs_valid(cmd)
         count = cmd.attrs.get("count", 0)
         lat = self.config.sram_pim.pim.nonlinear_latency_cycles
         self.energy.add_pim_nl(count)
-        # Register output object so downstream commands can read it
-        if cmd.object_id not in self.mem_mgr.objects:
-            out_obj = MemoryObject(cmd.object_id, ObjType.PSUM, cmd.bytes or 1024, "int32")
-            self.mem_mgr.register_object(out_obj)
-            if cmd.dst and cmd.dst.startswith("SRAM:"):
-                tile, banks = _parse_sram_loc(cmd.dst)
-                self.mem_mgr.allocate(cmd.object_id, tile, banks)
-            out_obj.valid_in_sram = True
-        else:
-            obj = self.mem_mgr.objects[cmd.object_id]
-            obj.valid_in_sram = True
+
+        self._ensure_output_object(cmd, ObjType.PSUM, "int32")
+        obj = self.mem_mgr.objects[cmd.object_id]
+        obj.begin_producing()
+
         return lat
 
     def _issue_pim_writeback(self, cmd: TraceCommand) -> int:
         obj = self.mem_mgr.objects.get(cmd.object_id)
         if obj:
-            obj.mark_dirty()
-            n_accesses = max(1, cmd.bytes // self.config.sram_pim.word_bytes)
+            n_accesses = ceil_div(cmd.bytes, self.config.sram_pim.word_bytes)
             self.energy.add_sram_write(n_accesses)
         return 1
 
+    # P0-05: SRAM_FREE must check dirty state
     def _issue_free(self, cmd: TraceCommand) -> int:
-        self.mem_mgr.free(cmd.object_id)
+        obj = self.mem_mgr.objects.get(cmd.object_id)
+        if obj and obj.dirty_in_sram:
+            self.correctness["illegal_evict_dirty_without_writeback"] += 1
+            if self.strict:
+                raise RuntimeError(
+                    f"cmd {cmd.cmd_id}: Cannot free dirty object "
+                    f"'{cmd.object_id}' without DMA_STORE")
+            # Auto-writeback in non-strict mode
+            lat = self._blocking_writeback(obj)
+            self.mem_mgr.free(cmd.object_id)
+            return lat
+        if obj:
+            self.mem_mgr.free(cmd.object_id)
         return 0
+
+    # P1-07: POWER_SET implementation
+    def _issue_power_set(self, cmd: TraceCommand) -> int:
+        target = cmd.attrs.get("state", "active")
+        obj = self.mem_mgr.objects.get(cmd.object_id)
+        if obj is None:
+            return 0
+        if target == "power_gated":
+            if obj.dirty_in_sram:
+                if self.strict:
+                    raise RuntimeError(
+                        f"Cannot power-gate dirty object {obj.object_id}")
+                self._blocking_writeback(obj)
+            obj.power_gate()
+            return self.config.sram_pim.power_state.wakeup_latency_cycles
+        elif target == "clock_gated":
+            obj.power_state = "clock_gated"
+            return 0
+        elif target == "active":
+            if obj.power_state == "power_gated":
+                obj.wakeup()
+                return self.config.sram_pim.power_state.wakeup_latency_cycles
+            obj.wakeup()
+            return 0
+        return 0
+
+    # P0-03: Completion handler — state updates happen HERE, not at issue
+    def _complete_command(self, cmd: TraceCommand) -> None:
+        if cmd.op == OpCode.DMA_LOAD:
+            obj = self.mem_mgr.objects.get(cmd.object_id)
+            if obj:
+                obj.commit_load()
+                n_accesses = ceil_div(cmd.bytes, self.config.sram_pim.word_bytes)
+                self.energy.add_sram_write(n_accesses)
+
+        elif cmd.op == OpCode.DMA_STORE:
+            obj = self.mem_mgr.objects.get(cmd.object_id)
+            if obj:
+                n_accesses = ceil_div(cmd.bytes, self.config.sram_pim.word_bytes)
+                self.energy.add_sram_read(n_accesses)
+                obj.writeback_complete()
+
+        elif cmd.op in {OpCode.PIM_MAC, OpCode.PIM_EW_OP,
+                        OpCode.PIM_REDUCE, OpCode.PIM_NL}:
+            obj = self.mem_mgr.objects.get(cmd.object_id)
+            if obj:
+                obj.commit_produce()
+
+        elif cmd.op == OpCode.PIM_WRITEBACK:
+            obj = self.mem_mgr.objects.get(cmd.object_id)
+            if obj:
+                obj.mark_dirty()
+
+    # P0-04: Allocate or spill/evict/writeback
+    def _allocate_or_spill(self, object_id: str, tile: int,
+                           banks: list) -> int:
+        obj = self.mem_mgr.objects[object_id]
+        needed = obj.bytes - self.mem_mgr.get_free_bytes(tile)
+        if needed <= 0:
+            needed = obj.bytes  # bank-level overflow
+        victims = self.mem_mgr.find_eviction_candidate(tile, needed)
+
+        if not victims:
+            self.correctness["capacity_overcommit_events"] += 1
+            if self.strict:
+                raise RuntimeError(
+                    f"No eviction candidate for {object_id}, "
+                    f"need {needed} bytes on tile {tile}")
+            # Force allocate in non-strict
+            obj.place_in_sram(tile, banks)
+            return 0
+
+        extra_lat = 0
+        for vid in victims:
+            victim = self.mem_mgr.objects[vid]
+            tile_v = victim.sram_tile
+            banks_v = list(victim.sram_banks)
+            if victim.dirty_in_sram:
+                extra_lat += self._blocking_writeback(victim)
+                self.mem_mgr.stats["writeback_count"] += 1
+            # Now safe to release capacity
+            self.mem_mgr._release_capacity(victim)
+            victim.valid_in_sram = False
+            victim.dirty_in_sram = False
+            victim.sram_tile = -1
+            victim.sram_banks = []
+            victim.state = ObjState.EVICTED
+            self.mem_mgr.stats["eviction_count"] += 1
+
+        ok = self.mem_mgr.allocate(object_id, tile, banks)
+        if not ok:
+            self.correctness["capacity_overcommit_events"] += 1
+            if self.strict:
+                raise RuntimeError(
+                    f"Allocation still fails after eviction: {object_id}")
+            obj.place_in_sram(tile, banks)
+        return extra_lat
+
+    def _blocking_writeback(self, obj: MemoryObject) -> int:
+        """Synchronously write dirty object back to DRAM."""
+        lat = self.dram.get_write_latency(obj.bytes)
+        self.energy.add_dram_write(obj.bytes)
+        self.energy.add_noc(obj.bytes)
+        n_accesses = ceil_div(obj.bytes, self.config.sram_pim.word_bytes)
+        self.energy.add_sram_read(n_accesses)
+        obj.writeback_complete()
+        self.mem_mgr.stats["spill_count"] += 1
+        return lat
+
+    # P1-05: Account for SRAM reads of inputs during PIM operations
+    def _account_pim_data_energy(self, cmd: TraceCommand, op_count: int):
+        word_bytes = self.config.sram_pim.word_bytes
+        for iid in parse_src_ids(cmd.src):
+            obj = self.mem_mgr.objects.get(iid)
+            if obj:
+                self.energy.add_sram_read(ceil_div(obj.bytes, word_bytes))
+
+        # Output write (and read-modify-write for accumulate)
+        out_bytes = cmd.attrs.get("out_bytes", cmd.bytes or 0)
+        if out_bytes > 0:
+            if cmd.attrs.get("accumulate", False):
+                self.energy.add_sram_read(ceil_div(out_bytes, word_bytes))
+            self.energy.add_sram_write(ceil_div(out_bytes, word_bytes))
+
+    def _ensure_output_object(self, cmd: TraceCommand, obj_type: ObjType,
+                              precision: str):
+        """Create output object if it doesn't exist (P0-06: valid_in_dram=False)."""
+        if cmd.object_id not in self.mem_mgr.objects:
+            out_bytes = cmd.attrs.get("out_bytes", cmd.bytes or 1024)
+            out_obj = MemoryObject(
+                cmd.object_id, obj_type, out_bytes, precision,
+                valid_in_dram=False, valid_in_sram=False,
+            )
+            self.mem_mgr.register_object(out_obj)
+            if cmd.dst and cmd.dst.startswith("SRAM:"):
+                loc = parse_sram_loc(cmd.dst)
+                self.mem_mgr.allocate(cmd.object_id, loc.tile,
+                                      list(loc.banks))
+
+    def _get_output_banks(self, cmd: TraceCommand) -> list:
+        """Get output bank list for PIM latency calculation."""
+        if cmd.object_id in self.mem_mgr.objects:
+            return self._banks_of_object(cmd.object_id)
+        if cmd.dst and cmd.dst.startswith("SRAM:"):
+            loc = parse_sram_loc(cmd.dst)
+            return global_bank_ids(loc, self.config.sram_pim.banks_per_tile)
+        return []
 
     def run(self) -> dict:
         if not self.commands:
             return self._make_report()
 
         pending = {cmd.cmd_id: cmd for cmd in self.commands}
-        issued = {}
         self.cycle = 0
         max_cycles = 100_000_000
 
         while (pending or self.event_queue) and self.cycle < max_cycles:
             # Release resources and complete events at this cycle
             self.resource.release_at(self.cycle)
-            while self.event_queue and self.event_queue[0][0] <= self.cycle:
-                _, cmd_id = heapq.heappop(self.event_queue)
-                self.completed.add(cmd_id)
+
+            # P0-03: Complete events and commit state changes
+            while self.event_queue and self.event_queue[0].finish_cycle <= self.cycle:
+                event = heapq.heappop(self.event_queue)
+                self._complete_command(event.cmd)
+                self.completed.add(event.cmd_id)
 
             # Find commands whose dependencies are met
-            deps_ready = [cid for cid, cmd in pending.items() if self._deps_ready(cmd)]
+            deps_ready = [cid for cid, cmd in pending.items()
+                          if self._deps_ready(cmd)]
 
-            # Among those, check resource availability and issue if possible
-            issued_this_cycle = False
+            # Check resource availability and issue
             resource_stalled = []
             for cid in deps_ready:
                 cmd = pending[cid]
@@ -268,25 +499,39 @@ class Simulator:
                     latency = self._issue_command(cmd)
                     if latency > 0:
                         self.resource.reserve(cmd.op, banks, cmd.bytes, latency)
-                        heapq.heappush(self.event_queue, (self.cycle + latency, cid))
+                        heapq.heappush(self.event_queue,
+                                       Event(self.cycle + latency, cid, cmd))
                     else:
+                        # Zero-latency commands complete immediately
+                        self._complete_command(cmd)
                         self.completed.add(cid)
-                    issued_this_cycle = True
                 else:
                     resource_stalled.append(cid)
 
-            # Count stall cycles: any cycle where at least one command is blocked by resources
             if resource_stalled:
                 self.latency_breakdown["bank_conflict_stall_cycles"] += 1
 
-            # Add leakage for this cycle
-            self.energy.add_leakage(1)
+            # Leakage per cycle (P1-07: track active vs gated banks)
+            active = self.mem_mgr.count_active_banks()
+            self.energy.add_leakage(1, active_banks=active)
 
+            # P0-09: Deadlock detection — raise error instead of forcing complete
             if not self.event_queue and not any(
                 self._deps_ready(cmd) for cmd in pending.values()
             ):
                 if pending:
-                    # Deadlock or unreachable deps -- force complete remaining
+                    self.correctness["deadlock_events"] += 1
+                    self.correctness["dependency_violations"] += len(pending)
+                    unresolved = {
+                        cid: [d for d in cmd.deps if d not in self.completed]
+                        for cid, cmd in pending.items()
+                        if not self._deps_ready(cmd)
+                    }
+                    if self.strict:
+                        raise RuntimeError(
+                            f"Deadlock: {len(pending)} commands with "
+                            f"unresolved deps: {unresolved}")
+                    # Non-strict: force complete
                     for cid in list(pending.keys()):
                         self.completed.add(cid)
                     pending.clear()
@@ -300,6 +545,7 @@ class Simulator:
         eb = self.energy.get_breakdown()
         freq = self.config.system.frequency_hz
         total_ns = self.cycle * 1e9 / freq
+        valid = all(v == 0 for v in self.correctness.values())
 
         return {
             "latency": {
@@ -316,8 +562,17 @@ class Simulator:
                 "noc_bytes": eb["noc_bytes"],
             },
             "correctness": self.correctness,
+            "valid_simulation": valid,
+            "memory_lifecycle": {
+                "spill_count": self.mem_mgr.stats["spill_count"],
+                "eviction_count": self.mem_mgr.stats["eviction_count"],
+                "writeback_count": self.mem_mgr.stats["writeback_count"],
+                "reload_count": self.mem_mgr.stats["reload_count"],
+            },
             "pim": {
                 "mac_count": eb["pim_mac_count"],
+                "ew_count": eb["pim_ew_count"],
                 "reduce_count": eb["pim_reduce_count"],
+                "nl_count": eb["pim_nl_count"],
             },
         }
