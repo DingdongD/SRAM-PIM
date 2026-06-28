@@ -4,7 +4,7 @@ from src.config import SimConfig
 from src.trace_ir import TraceCommand, OpCode
 from src.memory_object import MemoryObject, ObjType, ObjState
 from src.memory_manager import MemoryManager
-from src.dram_model import DRAMModel
+from src.dram_model import create_dram_model
 from src.energy_model import EnergyModel
 from src.resource_model import ResourceModel
 from src.utils.math_utils import ceil_div
@@ -32,7 +32,7 @@ class Simulator:
     def __init__(self, config: SimConfig):
         self.config = config
         self.mem_mgr = MemoryManager(config.sram_pim)
-        self.dram = DRAMModel(config.dram, config.system.frequency_hz)
+        self.dram = create_dram_model(config.dram, config.system.frequency_hz)
         self.energy = EnergyModel(config.energy, config.sram_pim,
                                   config.dram, config.system.frequency_hz)
         self.resource = ResourceModel(config.sram_pim)

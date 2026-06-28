@@ -7,6 +7,7 @@ from src.tracegen.gen_attention_trace import gen_attention_trace
 from src.simulator import Simulator
 from src.report import generate_report
 from src.trace_validator import TraceValidator
+from src.energy.destiny_adapter import apply_destiny_params
 
 
 def main():
@@ -35,10 +36,29 @@ def main():
     parser.add_argument("--hdim", type=int, default=256, help="Hidden/model dimension")
     parser.add_argument("--ff-scale", type=float, default=4.0, help="FFN expansion ratio")
     parser.add_argument("--batch", type=int, default=1, help="Batch size")
+    parser.add_argument("--sram-source", type=str, default=None,
+                        help="Override SRAM param source: analytical | destiny")
+    parser.add_argument("--dram-model", type=str, default=None,
+                        help="Override DRAM model: analytical | trace")
+    parser.add_argument("--dram-trace-out", type=str, default=None,
+                        help="Export DRAM trace to file (requires --dram-model trace)")
     args = parser.parse_args()
 
     config = load_config(args.config)
     mode = args.mode or config.system.mode
+
+    # P1-08: Apply DESTINY-derived SRAM parameters if requested
+    if args.dram_model:
+        config.dram.model = args.dram_model
+    if args.sram_source:
+        config.energy.sram.source = args.sram_source
+    sram_source = apply_destiny_params(config)
+    if sram_source == "destiny":
+        print(f"[INFO] SRAM params from DESTINY: "
+              f"read={config.energy.sram.read_pj_per_access:.2f}pJ, "
+              f"write={config.energy.sram.write_pj_per_access:.2f}pJ, "
+              f"leakage={config.energy.sram.leakage_mw_per_bank:.3f}mW/bank",
+              file=sys.stderr)
 
     if args.workload == "gemm":
         cmds = gen_gemm_trace(
@@ -97,6 +117,17 @@ def main():
     sim.load_trace(cmds)
     result = sim.run()
     report = generate_report(result, config)
+
+    # Export DRAM trace if requested
+    if args.dram_trace_out:
+        from src.dram_model import TraceDRAMModel
+        if isinstance(sim.dram, TraceDRAMModel):
+            sim.dram.export_trace(args.dram_trace_out)
+            print(f"[INFO] DRAM trace exported to {args.dram_trace_out}",
+                  file=sys.stderr)
+        else:
+            print("[WARN] --dram-trace-out requires --dram-model trace",
+                  file=sys.stderr)
 
     print(report)
     if args.output:
