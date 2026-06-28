@@ -3,6 +3,7 @@ from src.config import SimConfig
 
 
 def generate_report(result: dict, config: SimConfig) -> str:
+    lat = result["latency"]
     report = {
         "simulation_config": {
             "mode": config.system.mode,
@@ -13,13 +14,25 @@ def generate_report(result: dict, config: SimConfig) -> str:
             "pim_mode": config.sram_pim.pim.mode,
             "sram_params_source": config.energy.sram.source,
         },
-        "latency": result["latency"],
+        "latency": {
+            "total_cycles": lat["total_cycles"],
+            "total_ns": lat.get("total_ns", 0),
+            "dram_load_cycles": lat.get("dram_load_cycles", 0),
+            "dram_store_cycles": lat.get("dram_store_cycles", 0),
+            "pim_compute_cycles": lat.get("pim_compute_cycles", 0),
+            "pim_reduce_cycles": lat.get("pim_reduce_cycles", 0),
+        },
+        "stalls": {
+            "dependency_stall_cycles": lat.get("stall_dependency_cycles", 0),
+            "bank_conflict_stall_cycles": lat.get("bank_conflict_stall_cycles", 0),
+            "capacity_spill_cycles": lat.get("spill_writeback_cycles", 0),
+        },
         "energy": {k: round(v, 2) if isinstance(v, float) else v
                    for k, v in result["energy"].items()},
         "traffic": result["traffic"],
-        "correctness": result["correctness"],
-        "valid_simulation": result.get("valid_simulation", False),
         "memory_lifecycle": result.get("memory_lifecycle", {}),
         "pim": result["pim"],
+        "correctness": result["correctness"],
+        "valid_simulation": result.get("valid_simulation", False),
     }
     return yaml.dump(report, default_flow_style=False, sort_keys=False)

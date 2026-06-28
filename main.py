@@ -6,6 +6,7 @@ from src.tracegen.gen_gemm_trace import gen_gemm_trace
 from src.tracegen.gen_attention_trace import gen_attention_trace
 from src.simulator import Simulator
 from src.report import generate_report
+from src.trace_validator import TraceValidator
 
 
 def main():
@@ -21,6 +22,8 @@ def main():
     parser.add_argument("--mode", type=str, default=None,
                         help="Override: cold_start|warm_resident|amortized")
     parser.add_argument("--output", type=str, default=None, help="Output YAML file")
+    parser.add_argument("--validate-trace", action="store_true",
+                        help="Run static trace validation before simulation")
     # Attention-specific arguments
     parser.add_argument("--num-heads", type=int, default=8, help="Number of attention heads")
     parser.add_argument("--d-head", type=int, default=64, help="Dimension per attention head")
@@ -77,6 +80,18 @@ def main():
     else:
         print(f"Unknown workload: {args.workload}", file=sys.stderr)
         sys.exit(1)
+
+    if args.validate_trace:
+        validator = TraceValidator()
+        errors = validator.validate(cmds)
+        for e in errors:
+            print(f"[{e.severity.upper()}] cmd {e.cmd_id}: {e.message}",
+                  file=sys.stderr)
+        fatal = [e for e in errors if e.severity == "error"]
+        if fatal:
+            print(f"\nTrace validation failed with {len(fatal)} error(s).",
+                  file=sys.stderr)
+            sys.exit(1)
 
     sim = Simulator(config)
     sim.load_trace(cmds)
