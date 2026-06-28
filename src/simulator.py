@@ -49,6 +49,7 @@ class Simulator:
             "stall_dependency_cycles": 0,
             "bank_conflict_stall_cycles": 0,
             "spill_writeback_cycles": 0,
+            "auto_reload_cycles": 0,
             "final_writeback_cycles": 0,
         }
         self.correctness = {
@@ -163,7 +164,7 @@ class Simulator:
                     raise RuntimeError(
                         f"cmd {cmd.cmd_id} ({cmd.op.value}): "
                         f"input '{iid}' not in SRAM and DRAM copy invalid")
-                extra_lat += self._blocking_reload(obj)
+                extra_lat += self._blocking_reload(obj, cmd)
 
             # mode == "warn": just continue
 
@@ -446,6 +447,15 @@ class Simulator:
             if not ok:
                 extra_lat += self._allocate_or_spill(
                     cmd.object_id, loc.tile, list(loc.banks))
+        else:
+            # Tile consistency check: if already placed, dst must match
+            if cmd.dst and cmd.dst.startswith("SRAM:"):
+                loc = parse_sram_loc(cmd.dst)
+                if obj.sram_tile != loc.tile:
+                    raise RuntimeError(
+                        f"Output object {cmd.object_id} is already placed at "
+                        f"tile {obj.sram_tile}, but command dst requires "
+                        f"tile {loc.tile}")
 
         # Final placement check
         obj = self.mem_mgr.objects[cmd.object_id]
@@ -491,7 +501,7 @@ class Simulator:
         for vid in victims:
             victim = self.mem_mgr.objects[vid]
             if victim.dirty_in_sram:
-                extra_lat += self._blocking_writeback(victim)
+                extra_lat += self._writeback_victim(victim)
                 self.mem_mgr.stats["writeback_count"] += 1
             self.mem_mgr._release_capacity(victim)
             victim.valid_in_sram = False
@@ -510,6 +520,12 @@ class Simulator:
             obj.place_in_sram(tile, banks)
         return extra_lat
 
+    def _writeback_victim(self, victim: MemoryObject) -> int:
+        """Dispatch writeback to blocking or event-level model."""
+        if self.config.system.spill_model == "event_level":
+            return self._event_level_writeback(victim)
+        return self._blocking_writeback(victim)
+
     def _blocking_writeback(self, obj: MemoryObject) -> int:
         lat = self.dram.get_write_latency(obj.bytes)
         self.energy.add_dram_write(obj.bytes)
@@ -520,12 +536,49 @@ class Simulator:
         self.mem_mgr.stats["spill_count"] += 1
         return lat
 
-    def _blocking_reload(self, obj: MemoryObject) -> int:
-        """P0-C: Synchronously reload an evicted object from DRAM."""
+    def _event_level_writeback(self, victim: MemoryObject) -> int:
+        """Event-level writeback: same accounting as blocking for now,
+        but goes through DMA issue path for consistent resource tracking."""
+        # First version: blocking wait but through unified path
+        lat = self.dram.get_write_latency(victim.bytes)
+        self.energy.add_dram_write(victim.bytes)
+        self.energy.add_noc(victim.bytes)
+        n_accesses = ceil_div(victim.bytes, self.config.sram_pim.word_bytes)
+        self.energy.add_sram_read(n_accesses)
+        victim.writeback_complete()
+        self.mem_mgr.stats["spill_count"] += 1
+        return lat
+
+    def _choose_reload_location(self, obj: MemoryObject,
+                                cmd: TraceCommand) -> tuple:
+        """Choose SRAM tile/banks for reload placement.
+
+        Priority: historical location > command context > default tile 0.
+        """
+        bank_cap = self.config.sram_pim.bank_capacity_kb * 1024
+        n_banks = max(1, ceil_div(obj.bytes, bank_cap))
+
+        # 1. Historical location
+        if hasattr(obj, '_hist_tile') and obj._hist_tile >= 0:
+            return obj._hist_tile, list(range(n_banks))
+
+        # 2. Command context (src/dst tile)
+        if cmd.dst and cmd.dst.startswith("SRAM:"):
+            loc = parse_sram_loc(cmd.dst)
+            return loc.tile, list(range(n_banks))
+
+        if cmd.src and cmd.src.startswith("SRAM:"):
+            loc = parse_sram_loc(cmd.src)
+            return loc.tile, list(range(n_banks))
+
+        # 3. Default: tile 0
+        return 0, list(range(n_banks))
+
+    def _blocking_reload(self, obj: MemoryObject,
+                         cmd: TraceCommand = None) -> int:
+        """Synchronously reload an evicted object from DRAM."""
         if obj.sram_tile < 0:
-            # Simple first-fit placement on tile 0
-            tile = 0
-            banks = [0, 1]
+            tile, banks = self._choose_reload_location(obj, cmd)
             ok = self.mem_mgr.allocate(obj.object_id, tile, banks,
                                        make_valid=False)
             if not ok:
@@ -543,6 +596,7 @@ class Simulator:
         self.energy.add_sram_write(n_accesses)
         obj.commit_load()
         self.mem_mgr.stats["reload_count"] += 1
+        self.latency_breakdown["auto_reload_cycles"] += lat
         return extra + lat
 
     # ------------------------------------------------------------------ #
@@ -608,6 +662,13 @@ class Simulator:
                     "bytes": obj.bytes,
                 })
 
+        self.finalization_report = {
+            "final_dirty_policy": self.config.system.final_dirty_policy,
+            "final_dirty_count": len(self.final_dirty_objects),
+            "final_dirty_objects": [d["object_id"] for d in self.final_dirty_objects],
+            "final_dirty_after_policy": 0,
+        }
+
         if not self.final_dirty_objects:
             return
 
@@ -615,24 +676,32 @@ class Simulator:
 
         if policy == "error":
             self.correctness["final_dirty_objects"] = len(self.final_dirty_objects)
-            if self.strict:
-                raise RuntimeError(
-                    f"Trace ended with {len(self.final_dirty_objects)} dirty "
-                    f"persistent objects: "
-                    f"{[d['object_id'] for d in self.final_dirty_objects]}")
+            self.finalization_report["final_dirty_after_policy"] = len(self.final_dirty_objects)
+            raise RuntimeError(
+                f"Trace ended with {len(self.final_dirty_objects)} dirty "
+                f"persistent objects: "
+                f"{[d['object_id'] for d in self.final_dirty_objects]}")
 
         elif policy == "auto_writeback":
+            total_lat = 0
             for item in self.final_dirty_objects:
                 obj = self.mem_mgr.objects[item["object_id"]]
                 lat = self._blocking_writeback(obj)
-                self.latency_breakdown["final_writeback_cycles"] += lat
-                self.cycle += lat
+                total_lat += lat
+            self.latency_breakdown["final_writeback_cycles"] += total_lat
+            self.cycle += total_lat
+            self.finalization_report["final_auto_writeback_cycles"] = total_lat
+            self.finalization_report["final_dirty_after_policy"] = 0
             self.final_dirty_objects = []  # all written back
 
         elif policy == "report":
             self.correctness["final_dirty_objects"] = len(self.final_dirty_objects)
+            self.finalization_report["final_dirty_after_policy"] = len(self.final_dirty_objects)
 
-        # policy == "ignore": do nothing
+        elif policy == "ignore":
+            self.finalization_report["final_dirty_after_policy"] = len(self.final_dirty_objects)
+
+        # unknown policy: ignore silently
 
     # ------------------------------------------------------------------ #
     # Main simulation loop
@@ -748,11 +817,23 @@ class Simulator:
                 "final_dirty_objects": self.final_dirty_objects,
                 "final_resident_objects": self.final_resident_objects,
             },
+            "finalization": getattr(self, "finalization_report", {}),
             "model_provenance": {
                 "correctness_mode": self.config.system.correctness_mode,
+                "final_dirty_policy": self.config.system.final_dirty_policy,
                 "spill_model": self.config.system.spill_model,
+                "timing_fidelity": (
+                    "architectural_blocking_spill"
+                    if self.config.system.spill_model == "blocking"
+                    else "architectural_event_level_spill"
+                ),
                 "dram_model": self.config.dram.model,
                 "sram_param_source": self.config.energy.sram.source,
+                "sram_read_pj_per_access": self.config.energy.sram.read_pj_per_access,
+                "sram_write_pj_per_access": self.config.energy.sram.write_pj_per_access,
+                "sram_leakage_mw_per_bank": self.config.energy.sram.leakage_mw_per_bank,
+                "pim_mode": self.config.sram_pim.pim.mode,
+                "pim_energy_source": "analytical",
                 "workload_trace_semantics": "operator_level_approximation",
             },
         }

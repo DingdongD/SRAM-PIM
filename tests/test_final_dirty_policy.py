@@ -39,6 +39,15 @@ def test_final_dirty_output_error_policy_raises():
         sim.run()
 
 
+def test_final_dirty_error_policy_raises_regardless_of_correctness_mode():
+    """error policy must raise even in warn mode (not just strict)."""
+    sim = Simulator(make_config(
+        correctness_mode="warn", final_dirty_policy="error"))
+    sim.load_trace(_dirty_output_trace())
+    with pytest.raises(RuntimeError, match="dirty persistent"):
+        sim.run()
+
+
 def test_final_dirty_auto_writeback_counts_energy():
     """auto_writeback policy should write dirty objects back to DRAM."""
     sim = Simulator(make_config(

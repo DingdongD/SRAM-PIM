@@ -26,6 +26,8 @@ def generate_report(result: dict, config: SimConfig) -> str:
             "dependency_stall_cycles": lat.get("stall_dependency_cycles", 0),
             "bank_conflict_stall_cycles": lat.get("bank_conflict_stall_cycles", 0),
             "capacity_spill_cycles": lat.get("spill_writeback_cycles", 0),
+            "auto_reload_cycles": lat.get("auto_reload_cycles", 0),
+            "final_writeback_cycles": lat.get("final_writeback_cycles", 0),
         },
         "energy": {k: round(v, 2) if isinstance(v, float) else v
                    for k, v in result["energy"].items()},
@@ -35,6 +37,7 @@ def generate_report(result: dict, config: SimConfig) -> str:
         "correctness": result["correctness"],
         "valid_simulation": result.get("valid_simulation", False),
         "final_state": result.get("final_state", {}),
+        "finalization": result.get("finalization", {}),
         "model_provenance": result.get("model_provenance", {}),
     }
     return yaml.dump(report, default_flow_style=False, sort_keys=False)

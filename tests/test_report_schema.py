@@ -47,22 +47,41 @@ def test_report_has_final_state():
 
 
 def test_report_has_model_provenance():
-    """Report must include model_provenance section."""
+    """Report must include model_provenance section with full detail."""
     report, _ = _run_simple_trace()
     assert "model_provenance" in report
     mp = report["model_provenance"]
     assert mp["correctness_mode"] == "strict"
+    assert mp["final_dirty_policy"] == "report"
     assert mp["spill_model"] == "blocking"
+    assert mp["timing_fidelity"] == "architectural_blocking_spill"
     assert mp["dram_model"] == "analytical"
     assert mp["sram_param_source"] == "analytical"
+    assert mp["pim_mode"] == "digital_near_sram"
+    assert mp["pim_energy_source"] == "analytical"
+    assert mp["sram_read_pj_per_access"] > 0
+    assert mp["sram_write_pj_per_access"] > 0
     assert "workload_trace_semantics" in mp
 
 
+def test_report_has_finalization():
+    """Report must include finalization section."""
+    report, _ = _run_simple_trace()
+    assert "finalization" in report
+    fin = report["finalization"]
+    assert "final_dirty_policy" in fin
+    assert "final_dirty_count" in fin
+    assert "final_dirty_after_policy" in fin
+
+
 def test_yaml_report_includes_new_sections():
-    """YAML report via generate_report must include final_state and provenance."""
+    """YAML report via generate_report must include all new sections."""
     report, config = _run_simple_trace()
     yaml_str = generate_report(report, config)
     parsed = yaml.safe_load(yaml_str)
     assert "final_state" in parsed
+    assert "finalization" in parsed
     assert "model_provenance" in parsed
     assert parsed["model_provenance"]["correctness_mode"] == "strict"
+    assert "auto_reload_cycles" in parsed["stalls"]
+    assert "final_writeback_cycles" in parsed["stalls"]
