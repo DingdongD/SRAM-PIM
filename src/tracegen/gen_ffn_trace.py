@@ -64,14 +64,32 @@ def gen_ffn_trace(batch: int, seq_len: int, d_model: int, d_ff: int,
         c.cmd_id = old_to_new[c.cmd_id]
         c.deps = [old_to_new.get(d, d + id_offset) for d in c.deps]
 
+    # Build a rename map for down-projection object IDs, then apply to both
+    # object_id fields and src references so the simulator can track residency.
+    down_obj_ids: set[str] = set()
+    for c in down_cmds_raw:
+        down_obj_ids.add(c.object_id)
+        for tok in c.src.split(","):
+            tok = tok.strip()
+            if tok and tok != "-" and not tok.startswith("DRAM:") and not tok.startswith("SRAM:"):
+                down_obj_ids.add(tok)
+
+    def _down_rename(name: str) -> str:
+        if name.startswith("W_"):
+            return "FFN_down_" + name
+        if name.startswith("X_"):
+            return "FFN_down_" + name
+        if name.startswith("Y_"):
+            return "FFN_out_" + name
+        return name
+
+    down_rename_map = {oid: _down_rename(oid) for oid in down_obj_ids}
+
     # Rename object IDs to avoid collision with up_cmds objects
     for c in down_cmds_raw:
-        if c.object_id.startswith("W_"):
-            c.object_id = "FFN_down_" + c.object_id
-        elif c.object_id.startswith("X_"):
-            c.object_id = "FFN_down_" + c.object_id
-        elif c.object_id.startswith("Y_"):
-            c.object_id = "FFN_out_" + c.object_id
+        c.object_id = down_rename_map.get(c.object_id, c.object_id)
+        src_parts = [s.strip() for s in c.src.split(",")]
+        c.src = ",".join(down_rename_map.get(s, s) for s in src_parts)
 
     # First command of down-projection depends on the activation completing
     if down_cmds_raw:

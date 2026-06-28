@@ -194,6 +194,17 @@ class Simulator:
         count = cmd.attrs.get("count", 0)
         lat = self.config.sram_pim.pim.reduce_latency_cycles
         self.energy.add_pim_reduce(count)
+        # Register output object so downstream commands can read it
+        if cmd.object_id not in self.mem_mgr.objects:
+            out_obj = MemoryObject(cmd.object_id, ObjType.PSUM, cmd.bytes or 1024, "int32")
+            self.mem_mgr.register_object(out_obj)
+            if cmd.dst and cmd.dst.startswith("SRAM:"):
+                tile, banks = _parse_sram_loc(cmd.dst)
+                self.mem_mgr.allocate(cmd.object_id, tile, banks)
+            out_obj.valid_in_sram = True
+        else:
+            obj = self.mem_mgr.objects[cmd.object_id]
+            obj.valid_in_sram = True
         self.latency_breakdown["pim_reduce_cycles"] += lat
         return lat
 
@@ -202,6 +213,17 @@ class Simulator:
         count = cmd.attrs.get("count", 0)
         lat = self.config.sram_pim.pim.nonlinear_latency_cycles
         self.energy.add_pim_nl(count)
+        # Register output object so downstream commands can read it
+        if cmd.object_id not in self.mem_mgr.objects:
+            out_obj = MemoryObject(cmd.object_id, ObjType.PSUM, cmd.bytes or 1024, "int32")
+            self.mem_mgr.register_object(out_obj)
+            if cmd.dst and cmd.dst.startswith("SRAM:"):
+                tile, banks = _parse_sram_loc(cmd.dst)
+                self.mem_mgr.allocate(cmd.object_id, tile, banks)
+            out_obj.valid_in_sram = True
+        else:
+            obj = self.mem_mgr.objects[cmd.object_id]
+            obj.valid_in_sram = True
         return lat
 
     def _issue_pim_writeback(self, cmd: TraceCommand) -> int:

@@ -27,6 +27,11 @@ def main():
     parser.add_argument("--seq-len", type=int, default=128, help="Sequence length")
     parser.add_argument("--stage", type=str, default="generation",
                         help="Attention stage: generation (decode) or summarization (prefill)")
+    # Transformer-specific arguments
+    parser.add_argument("--ndec", type=int, default=1, help="Number of decoder layers")
+    parser.add_argument("--hdim", type=int, default=256, help="Hidden/model dimension")
+    parser.add_argument("--ff-scale", type=float, default=4.0, help="FFN expansion ratio")
+    parser.add_argument("--batch", type=int, default=1, help="Batch size")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -46,6 +51,25 @@ def main():
             num_heads=args.num_heads,
             d_head=args.d_head,
             sram_config=config.sram_pim,
+            precision=config.workload.precision.activation,
+            mode=mode,
+            stage=args.stage,
+        )
+    elif args.workload == "transformer":
+        model_config = {
+            "name": "custom",
+            "ndec": args.ndec,
+            "hdim": args.hdim,
+            "num_heads": args.num_heads,
+            "d_head": args.d_head,
+            "ff_scale": args.ff_scale,
+            "batch": args.batch,
+            "seq_len": args.seq_len,
+            "gen_len": 1,
+        }
+        from src.tracegen.gen_transformer_trace import gen_transformer_trace
+        cmds = gen_transformer_trace(
+            model_config, config.sram_pim,
             precision=config.workload.precision.activation,
             mode=mode,
             stage=args.stage,
