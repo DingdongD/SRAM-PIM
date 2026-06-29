@@ -41,13 +41,15 @@ class DRAMEnergyConfig:
 
 @dataclass
 class DRAMConfig:
-    model: str = "analytical"
+    model: str = "analytical"  # analytical | trace | dramsim3
     type: str = "LPDDR4"
     channels: int = 1
     bus_width_bits: int = 64
     burst_bytes: int = 64
     effective_bandwidth_gbps: float = 25.6
     fixed_latency_ns: float = 80.0
+    dramsim3_dir: str = "/home/NPU-PIM-co-simulator/DRAMsim3"
+    dramsim3_config: str = ""
     energy: DRAMEnergyConfig = field(default_factory=DRAMEnergyConfig)
 
 

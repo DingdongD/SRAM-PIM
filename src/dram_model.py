@@ -108,6 +108,54 @@ class TraceDRAMModel(BaseDRAMModel):
         return list(self._trace_log)
 
 
+class DRAMSim3Model(BaseDRAMModel):
+    """Cycle-accurate DRAM model backed by DRAMSim3 binary.
+
+    Falls back to analytical timing if DRAMSim3 binary is not available
+    or returns 0.
+    """
+
+    def __init__(self, config: DRAMConfig, freq_hz: int):
+        from src.dramsim3_wrapper import DRAMsim3Wrapper
+        self.config = config
+        self.freq_hz = freq_hz
+        # Analytical fallback
+        bw_bytes_per_sec = config.effective_bandwidth_gbps * 1e9
+        self.bytes_per_cycle = bw_bytes_per_sec / freq_hz
+        self.fixed_latency_cycles = int(config.fixed_latency_ns * freq_hz / 1e9)
+
+        dramsim3_dir = getattr(config, "dramsim3_dir",
+                               "/home/NPU-PIM-co-simulator/DRAMsim3")
+        dramsim3_config = getattr(config, "dramsim3_config",
+                                  os.path.join(dramsim3_dir,
+                                               "configs/DDR4_8Gb_x8_2400.ini"))
+        self.wrapper = DRAMsim3Wrapper(
+            config_file=dramsim3_config,
+            dramsim3_dir=dramsim3_dir,
+        )
+        self._addr_counter = 0
+
+    def _fallback_latency(self, nbytes: int) -> int:
+        transfer = math.ceil(nbytes / self.bytes_per_cycle) if nbytes > 0 else 0
+        return self.fixed_latency_cycles + transfer
+
+    def get_read_latency(self, nbytes: int) -> int:
+        addr = self._addr_counter
+        self._addr_counter += nbytes
+        lat = self.wrapper.get_latency_for_transfer(
+            addr, nbytes, is_write=False,
+            burst_bytes=self.config.burst_bytes)
+        return lat if lat > 0 else self._fallback_latency(nbytes)
+
+    def get_write_latency(self, nbytes: int) -> int:
+        addr = self._addr_counter
+        self._addr_counter += nbytes
+        lat = self.wrapper.get_latency_for_transfer(
+            addr, nbytes, is_write=True,
+            burst_bytes=self.config.burst_bytes)
+        return lat if lat > 0 else self._fallback_latency(nbytes)
+
+
 # Keep backward compatibility
 DRAMModel = AnalyticalDRAMModel
 
@@ -116,5 +164,7 @@ def create_dram_model(config: DRAMConfig, freq_hz: int) -> BaseDRAMModel:
     """Factory: create the appropriate DRAM model based on config.dram.model."""
     if config.model == "trace":
         return TraceDRAMModel(config, freq_hz)
+    if config.model == "dramsim3":
+        return DRAMSim3Model(config, freq_hz)
     # Default: analytical
     return AnalyticalDRAMModel(config, freq_hz)

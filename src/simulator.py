@@ -41,11 +41,13 @@ class Simulator:
         self.commands = []
         self.completed = set()
         self.event_queue: list[Event] = []
+        self._internal_cmd_counter = -1  # negative IDs for internal commands
         self.latency_breakdown = {
             "dram_load_cycles": 0,
             "dram_store_cycles": 0,
             "pim_compute_cycles": 0,
             "pim_reduce_cycles": 0,
+            "pim_nl_cycles": 0,
             "stall_dependency_cycles": 0,
             "bank_conflict_stall_cycles": 0,
             "spill_writeback_cycles": 0,
@@ -53,7 +55,6 @@ class Simulator:
             "final_writeback_cycles": 0,
         }
         self.correctness = {
-            "illegal_read_unresident_object": 0,
             "missing_input_object": 0,
             "illegal_read_power_gated_object": 0,
             "illegal_evict_dirty_without_writeback": 0,
@@ -61,6 +62,10 @@ class Simulator:
             "dependency_violations": 0,
             "deadlock_events": 0,
             "final_dirty_objects": 0,
+        }
+        self.lifecycle_events = {
+            "unresident_input_events": 0,
+            "auto_reload_events": 0,
         }
         self.final_dirty_objects: list[dict] = []
         self.final_resident_objects: list[dict] = []
@@ -152,7 +157,7 @@ class Simulator:
             if obj.valid_in_sram:
                 continue
 
-            self.correctness["illegal_read_unresident_object"] += 1
+            self.lifecycle_events["unresident_input_events"] += 1
 
             if mode == "strict":
                 raise RuntimeError(
@@ -337,6 +342,7 @@ class Simulator:
         obj = self.mem_mgr.objects[cmd.object_id]
         obj.begin_producing()
 
+        self.latency_breakdown["pim_nl_cycles"] += compute_lat
         return compute_lat + alloc_lat + reload_lat
 
     def _issue_pim_writeback(self, cmd: TraceCommand) -> int:
@@ -553,18 +559,42 @@ class Simulator:
             self.mem_mgr.stats["final_writeback_count"] += 1
         return lat
 
+    def _next_internal_cmd_id(self) -> int:
+        self._internal_cmd_counter -= 1
+        return self._internal_cmd_counter + 1
+
     def _event_level_writeback(self, victim: MemoryObject) -> int:
-        """Event-level writeback stub: same accounting as blocking for now,
-        but goes through DMA issue path for consistent resource tracking.
-        NOTE: True event-level would enqueue internal DMA_STORE commands."""
+        """True event-level writeback: create an internal DMA_STORE command
+        and enqueue it in the event queue for consistent resource tracking."""
+        internal_id = self._next_internal_cmd_id()
+        internal_cmd = TraceCommand(
+            cmd_id=internal_id,
+            op=OpCode.DMA_STORE,
+            object_id=victim.object_id,
+            src=f"SRAM:T{victim.sram_tile}:B{victim.sram_banks[0]}" if victim.sram_banks else "SRAM:T0:B0",
+            dst=f"DRAM:0x{victim.dram_addr:X}",
+            bytes=victim.bytes,
+            attrs={"internal": True, "reason": "spill"},
+            deps=[],
+        )
+        # Issue the DMA_STORE through the normal path for energy/traffic accounting
+        victim.begin_spilling()
         lat = self.dram.get_write_latency(victim.bytes)
         self.energy.add_dram_write(victim.bytes)
         self.energy.add_noc(victim.bytes)
         n_accesses = ceil_div(victim.bytes, self.config.sram_pim.word_bytes)
         self.energy.add_sram_read(n_accesses)
+        self.latency_breakdown["dram_store_cycles"] += lat
+
+        # Enqueue the completion event
+        heapq.heappush(self.event_queue,
+                       Event(self.cycle + lat, internal_id, internal_cmd))
+
+        # Complete the writeback state immediately (non-blocking for the caller)
         victim.writeback_complete()
         self.mem_mgr.stats["spill_count"] += 1
-        return lat
+        # Return 0: event-level writeback is non-blocking (overlaps with compute)
+        return 0
 
     def _choose_reload_location(self, obj: MemoryObject,
                                 cmd: TraceCommand) -> tuple:
@@ -613,6 +643,7 @@ class Simulator:
         self.energy.add_sram_write(n_accesses)
         obj.commit_load()
         self.mem_mgr.stats["reload_count"] += 1
+        self.lifecycle_events["auto_reload_events"] += 1
         self.latency_breakdown["auto_reload_cycles"] += lat
         return extra + lat
 
@@ -799,14 +830,19 @@ class Simulator:
     # Report generation
     # ------------------------------------------------------------------ #
     def _compute_valid_simulation(self) -> bool:
-        counters = dict(self.correctness)
-        mode = self.config.system.correctness_mode
-        # In auto_reload mode, unresident input events are legal cache misses
-        if mode == "auto_reload":
-            counters.pop("illegal_read_unresident_object", None)
+        # Correctness errors (always fatal)
+        if any(v > 0 for v in self.correctness.values()):
+            return False
         finalization_ok = getattr(self, "finalization_report", {}).get(
             "final_dirty_after_policy", 0) == 0
-        return all(v == 0 for v in counters.values()) and finalization_ok
+        if not finalization_ok:
+            return False
+        # Lifecycle events: unresident_input_events are only errors in strict/warn
+        mode = self.config.system.correctness_mode
+        if mode not in ("auto_reload",):
+            if self.lifecycle_events.get("unresident_input_events", 0) > 0:
+                return False
+        return True
 
     def _make_report(self) -> dict:
         eb = self.energy.get_breakdown()
@@ -828,7 +864,13 @@ class Simulator:
                 "sram_write_accesses": eb["sram_write_count"],
                 "noc_bytes": eb["noc_bytes"],
             },
-            "correctness": self.correctness,
+            "correctness": {
+                **self.correctness,
+                # backward compat alias
+                "illegal_read_unresident_object":
+                    self.lifecycle_events["unresident_input_events"],
+            },
+            "lifecycle_events": self.lifecycle_events,
             "valid_simulation": valid,
             "memory_lifecycle": {
                 "spill_count": self.mem_mgr.stats["spill_count"],

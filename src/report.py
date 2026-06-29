@@ -21,6 +21,7 @@ def generate_report(result: dict, config: SimConfig) -> str:
             "dram_store_cycles": lat.get("dram_store_cycles", 0),
             "pim_compute_cycles": lat.get("pim_compute_cycles", 0),
             "pim_reduce_cycles": lat.get("pim_reduce_cycles", 0),
+            "pim_nl_cycles": lat.get("pim_nl_cycles", 0),
         },
         "stalls": {
             "dependency_stall_cycles": lat.get("stall_dependency_cycles", 0),
@@ -35,6 +36,7 @@ def generate_report(result: dict, config: SimConfig) -> str:
         "memory_lifecycle": result.get("memory_lifecycle", {}),
         "pim": result["pim"],
         "correctness": result["correctness"],
+        "lifecycle_events": result.get("lifecycle_events", {}),
         "valid_simulation": result.get("valid_simulation", False),
         "final_state": result.get("final_state", {}),
         "finalization": result.get("finalization", {}),
