@@ -1,0 +1,62 @@
+architecture:
+  name: stacked-sram-centralized-systolic
+  frequency_hz: 1000000000
+  compute_placement: centralized_logic
+  bank_groups: 4
+
+  arrays:
+    count: 2
+    rows: 128
+    cols: 128
+    dataflow: ws
+
+  stacked_sram:
+    tiers: 4
+    banks_per_tier: 16
+    bank_capacity_bytes: 262144
+    line_bytes: 64
+    read_ports_per_bank: 1
+    write_ports_per_bank: 1
+    read_latency_cycles: 3
+    write_latency_cycles: 3
+    read_bytes_per_cycle: 32
+    write_bytes_per_cycle: 32
+
+  vertical_link:
+    groups: 8
+    latency_cycles: 2
+    bytes_per_cycle: 64
+
+  global_buffer:
+    capacity_bytes: 1048576
+    read_ports: 4
+    write_ports: 4
+    read_latency_cycles: 1
+    write_latency_cycles: 1
+    read_bytes_per_cycle: 64
+    write_bytes_per_cycle: 64
+
+  noc:
+    groups: 4
+    latency_cycles: 2
+    bytes_per_cycle: 64
+
+  reduction:
+    units: 2
+    lanes_per_unit: 32
+    latency_cycles: 2
+
+mapping:
+  tile_m: 128
+  tile_n: 128
+  tile_k: 128
+  partition_dim: N
+  prefetch_distance_cycles: 8
+
+backend:
+  kind: scalesim
+  architecture_config: /absolute/path/to/scalesim.cfg
+  python_executable: python3
+  module: scalesim.scale
+  timeout_seconds: 600
+  trace_word_bytes: 1
