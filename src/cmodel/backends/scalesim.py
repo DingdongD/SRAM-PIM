@@ -59,7 +59,7 @@ class ScaleSimBackend:
             self._write_topology(topology, op_id, m, n, k)
             env = os.environ.copy()
             env["PYTHONPATH"] = str(self.repository)
-            subprocess.run(
+            completed = subprocess.run(
                 [
                     self.spec.python_executable,
                     "-m",
@@ -68,16 +68,24 @@ class ScaleSimBackend:
                     str(self.architecture_config),
                     "-t",
                     str(topology),
+                    "-i",
+                    "gemm",
                     "-p",
                     str(output_root),
                 ],
                 cwd=self.repository,
                 env=env,
-                check=True,
+                check=False,
                 capture_output=True,
                 text=True,
                 timeout=self.spec.timeout_seconds,
             )
+            if completed.returncode != 0:
+                raise BackendProtocolError(
+                    "SCALE-Sim execution failed:\n"
+                    f"stdout:\n{completed.stdout}\n"
+                    f"stderr:\n{completed.stderr}"
+                )
             run_root = output_root / self.spec.run_name
             report_path = run_root / "COMPUTE_REPORT.csv"
             trace_root = run_root / "layer0"
@@ -107,19 +115,8 @@ class ScaleSimBackend:
     def _write_topology(path: Path, op_id: str, m: int, n: int, k: int) -> None:
         with path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.writer(handle)
-            writer.writerow(
-                [
-                    "Layer name",
-                    "IFMAP Height",
-                    "IFMAP Width",
-                    "Filter Height",
-                    "Filter Width",
-                    "Channels",
-                    "Num Filter",
-                    "Strides",
-                ]
-            )
-            writer.writerow([op_id, 1, m, 1, 1, k, n, 1])
+            writer.writerow(["Layer Name", "M", "N", "K"])
+            writer.writerow([op_id, m, n, k])
 
     @staticmethod
     def _parse_report(path: Path) -> tuple[int, float]:
