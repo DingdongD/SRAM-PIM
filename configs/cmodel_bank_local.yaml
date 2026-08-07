@@ -1,0 +1,110 @@
+architecture:
+  name: stacked_sram_bank_local
+  frequency_hz: 1000000000
+  compute_placement: bank_local_logic
+  bank_groups: 4
+  arrays:
+    count: 4
+    rows: 128
+    cols: 128
+    dataflow: ws
+  stacked_sram:
+    tiers: 4
+    banks_per_tier: 16
+    bank_capacity_bytes: 1048576
+    line_bytes: 64
+    read_ports_per_bank: 1
+    write_ports_per_bank: 1
+  vertical_link:
+    groups: 4
+    latency_cycles: 2
+    bytes_per_cycle: 128
+  global_buffer:
+    capacity_bytes: 1048576
+    read_ports: 4
+    write_ports: 4
+  vector:
+    lanes: 128
+    bytes_per_cycle: 128
+    max_cycles_per_element: 1
+    sub_cycles_per_element: 1
+    exp_cycles_per_element: 4
+    add_cycles_per_element: 1
+    reciprocal_cycles_per_element: 4
+    multiply_cycles_per_element: 1
+    rsqrt_cycles_per_element: 6
+    affine_cycles_per_element: 2
+  reduction:
+    units: 1
+    lanes_per_unit: 128
+    cycles_per_stage: 1
+  noc:
+    nodes: 16
+    flit_bytes: 16
+    endpoint_for_global_buffer: 14
+    endpoint_for_dram: 15
+    endpoint_for_bank_group: [0, 1, 2, 3]
+    vc_activation: 0
+    vc_weight: 1
+    vc_output: 2
+    vc_partial_sum: 3
+    vc_control: 4
+  dram:
+    read_request_type: 0
+    write_request_type: 1
+    transaction_bytes: 32
+    source_id: 0
+mapping:
+  tile_m: 128
+  tile_n: 128
+  tile_k: 128
+  partition_dim: N
+addresses:
+  input_base: 268435456
+  weight_base: 536870912
+  output_base: 805306368
+  temporary_base: 1073741824
+  kv_cache_base: 1342177280
+  region_bytes: 134217728
+  alignment_bytes: 64
+backends:
+  scalesim:
+    repository:
+      path: third_party/scalesim
+      expected_commit: 9f98c4371055a54c75209c2e02b640b897550532
+    python_executable: python3
+    module: scalesim.scale
+    architecture_config: configs/external/scalesim_strict.cfg
+    run_name: strict_cmodel
+    timeout_seconds: 600
+    trace_word_bytes: 1
+  ramulator2:
+    repository:
+      path: third_party/ramulator2
+      expected_commit: b30320bc9385b708e86b67ebb9f48858cc66d798
+    executable: third_party/bin/ramulator2_bridge
+    config_path: third_party/ramulator2/strict_external.yaml
+    protocol_version: 1
+    timeout_seconds: 600
+    ticks_numerator: 1
+    ticks_denominator: 1
+  booksim2:
+    repository:
+      path: third_party/booksim2
+      expected_commit: 28f43299f1706a3160ffac721ca461d74eb6e618
+    executable: third_party/bin/booksim2_bridge
+    config_path: configs/external/booksim2_mesh.cfg
+    protocol_version: 1
+    timeout_seconds: 600
+    ticks_numerator: 1
+    ticks_denominator: 1
+  sram_macro:
+    kind: cacti
+    repository:
+      path: third_party/cacti
+      expected_commit: 1ffd8dfb10303d306ecd8d215320aea07651e878
+    executable: third_party/cacti/cacti
+    config_path: third_party/cacti/strict_sram.cfg
+    timeout_seconds: 600
+simulation:
+  max_cycles: 100000000
