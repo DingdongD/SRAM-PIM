@@ -1,5 +1,8 @@
-from .base import SystolicBackend
-from .recorded import RecordedSystolicBackend
-from .scalesim import ScaleSimBackend
+"""Strict external simulator adapters."""
 
-__all__ = ["SystolicBackend", "RecordedSystolicBackend", "ScaleSimBackend"]
+from .booksim2 import BookSim2Backend
+from .ramulator2 import Ramulator2Backend
+from .scalesim import ScaleSimBackend
+from .sram_macro import SRAMMacroBackend
+
+__all__ = ["BookSim2Backend", "Ramulator2Backend", "ScaleSimBackend", "SRAMMacroBackend"]

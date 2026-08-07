@@ -1,125 +1,97 @@
-import os
+from __future__ import annotations
+
 import re
 import subprocess
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from pathlib import Path
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class SRAMParams:
-    read_latency_ns: float = 0.534
-    write_latency_ns: float = 0.612
-    read_energy_pj: float = 3.2
-    write_energy_pj: float = 3.8
-    leakage_mw: float = 12.5
-    area_mm2: float = 0.42
-    tech_nm: int = 28
-    capacity_kb: int = 256
-    banks: int = 32
+    read_latency_ns: float
+    write_latency_ns: float
+    read_energy_pj: float
+    write_energy_pj: float
+    leakage_mw: float
+    area_mm2: float
+    tech_nm: int
+    capacity_kb: int
+    banks: int
 
 
 class DestinyAdapter:
-    """Adapter that extracts SRAM macro parameters from DESTINY or falls back to defaults."""
+    def __init__(self, destiny_dir: str):
+        self.destiny_dir = Path(destiny_dir).resolve()
+        self.executable = self.destiny_dir / "destiny"
+        self.cell_file = self.destiny_dir / "config" / "3D" / "SRAM" / "SRAM.cell"
+        if not self.executable.is_file():
+            raise FileNotFoundError(self.executable)
+        if not self.cell_file.is_file():
+            raise FileNotFoundError(self.cell_file)
 
-    def __init__(self, destiny_dir: str = "/home/Destiny-Memory-simulator"):
-        self.destiny_dir = destiny_dir
-        self.cell_file = os.path.join(destiny_dir, "config", "3D", "SRAM", "SRAM.cell")
-
-    def generate_config(self, tech_nm: int = 28, capacity_kb: int = 256,
-                        banks: int = 32, word_bits: int = 128) -> str:
-        """Generate a DESTINY config file for the given SRAM parameters."""
-        cfg = (
-            f"-DesignTarget: cache\n"
-            f"\n"
-            f"-CacheAccessMode: Normal\n"
-            f"-Associativity (for cache only): 1\n"
-            f"\n"
-            f"-ProcessNode: {tech_nm}\n"
-            f"\n"
+    def generate_config(self, tech_nm: int, capacity_kb: int, banks: int, word_bits: int) -> str:
+        if tech_nm <= 0 or capacity_kb <= 0 or banks <= 0 or word_bits <= 0:
+            raise ValueError("DESTINY SRAM configuration values must be positive")
+        return (
+            "-DesignTarget: cache\n\n"
+            "-CacheAccessMode: Normal\n"
+            "-Associativity (for cache only): 1\n\n"
+            f"-ProcessNode: {tech_nm}\n\n"
             f"-Capacity (KB): {capacity_kb}\n"
-            f"-WordWidth (bit): {word_bits}\n"
-            f"\n"
-            f"-DeviceRoadmap: HP\n"
-            f"\n"
-            f"-LocalWireType: LocalAggressive\n"
-            f"-LocalWireRepeaterType: RepeatedNone\n"
-            f"-LocalWireUseLowSwing: No\n"
-            f"\n"
-            f"-GlobalWireType: GlobalAggressive\n"
-            f"-GlobalWireRepeaterType: RepeatedNone\n"
-            f"-GlobalWireUseLowSwing: No\n"
-            f"\n"
-            f"-Routing: H-tree\n"
-            f"\n"
-            f"-InternalSensing: true\n"
-            f"\n"
-            f"-MemoryCellInputFile: {self.cell_file}\n"
-            f"\n"
-            f"-Temperature (K): 350\n"
-            f"\n"
-            f"-OptimizationTarget: ReadLatency\n"
-            f"-EnablePruning: Yes\n"
-            f"\n"
-            f"-BufferDesignOptimization: latency\n"
-            f"\n"
-            f"-StackedDieCount: 1\n"
-            f"-LocalTSVProjection: 0\n"
-            f"-GlobalTSVProjection: 0\n"
-            f"-TSVRedundancy: 1.0\n"
+            f"-WordWidth (bit): {word_bits}\n\n"
+            "-DeviceRoadmap: HP\n\n"
+            "-LocalWireType: LocalAggressive\n"
+            "-LocalWireRepeaterType: RepeatedNone\n"
+            "-LocalWireUseLowSwing: No\n\n"
+            "-GlobalWireType: GlobalAggressive\n"
+            "-GlobalWireRepeaterType: RepeatedNone\n"
+            "-GlobalWireUseLowSwing: No\n\n"
+            "-Routing: H-tree\n\n"
+            "-InternalSensing: true\n\n"
+            f"-MemoryCellInputFile: {self.cell_file}\n\n"
+            "-Temperature (K): 350\n\n"
+            "-OptimizationTarget: ReadLatency\n"
+            "-EnablePruning: Yes\n\n"
+            "-BufferDesignOptimization: latency\n\n"
+            "-StackedDieCount: 1\n"
+            "-LocalTSVProjection: 0\n"
+            "-GlobalTSVProjection: 0\n"
+            "-TSVRedundancy: 1.0\n"
         )
-        return cfg
 
-    def run(self, tech_nm: int = 28, capacity_kb: int = 256,
-            banks: int = 32, word_bits: int = 128) -> SRAMParams:
-        """Run DESTINY and parse its output, falling back to analytical defaults."""
-        cfg_content = self.generate_config(tech_nm, capacity_kb, banks, word_bits)
-
-        exe = os.path.join(self.destiny_dir, "destiny")
-        if not os.path.exists(exe):
-            return SRAMParams(tech_nm=tech_nm, capacity_kb=capacity_kb, banks=banks)
-
-        tmp_fd, cfg_path = tempfile.mkstemp(suffix=".cfg", dir=self.destiny_dir)
-        try:
-            with os.fdopen(tmp_fd, "w") as f:
-                f.write(cfg_content)
-
-            result = subprocess.run(
-                [exe, cfg_path],
+    def run(self, tech_nm: int, capacity_kb: int, banks: int, word_bits: int) -> SRAMParams:
+        config = self.generate_config(tech_nm, capacity_kb, banks, word_bits)
+        with tempfile.TemporaryDirectory(prefix="strict_destiny_") as temp_dir:
+            config_path = Path(temp_dir) / "sram.cfg"
+            config_path.write_text(config, encoding="utf-8")
+            completed = subprocess.run(
+                [str(self.executable), str(config_path)],
+                cwd=self.destiny_dir,
+                check=True,
                 capture_output=True,
                 text=True,
-                timeout=120,
-                cwd=self.destiny_dir,
             )
-            output = result.stdout + result.stderr
-            params = self.parse_output(output)
-            params.tech_nm = tech_nm
-            params.capacity_kb = capacity_kb
-            params.banks = banks
-            return params
-        except (subprocess.TimeoutExpired, subprocess.SubprocessError, OSError):
-            return SRAMParams(tech_nm=tech_nm, capacity_kb=capacity_kb, banks=banks)
-        finally:
-            try:
-                os.unlink(cfg_path)
-            except OSError:
-                pass
+        parsed = self.parse_output(completed.stdout + "\n" + completed.stderr)
+        return SRAMParams(
+            parsed[0], parsed[1], parsed[2], parsed[3], parsed[4], parsed[5],
+            tech_nm, capacity_kb, banks,
+        )
 
-    def parse_output(self, output: str) -> SRAMParams:
-        """Parse DESTINY stdout and return SRAMParams populated from the output."""
-        params = SRAMParams()
-
-        patterns = {
-            "read_latency_ns": r"Read Latency[^:]*:\s*(\d+\.?\d*(?:e[+-]?\d+)?)",
-            "write_latency_ns": r"Write Latency[^:]*:\s*(\d+\.?\d*(?:e[+-]?\d+)?)",
-            "read_energy_pj": r"Read Dynamic Energy[^:]*:\s*(\d+\.?\d*(?:e[+-]?\d+)?)",
-            "write_energy_pj": r"Write Dynamic Energy[^:]*:\s*(\d+\.?\d*(?:e[+-]?\d+)?)",
-            "leakage_mw": r"Leakage Power[^:]*:\s*(\d+\.?\d*(?:e[+-]?\d+)?)",
-            "area_mm2": r"Area[^:]*:\s*(\d+\.?\d*(?:e[+-]?\d+)?)",
-        }
-
-        for field_name, pattern in patterns.items():
-            m = re.search(pattern, output)
-            if m:
-                setattr(params, field_name, float(m.group(1)))
-
-        return params
+    @staticmethod
+    def parse_output(output: str) -> tuple[float, float, float, float, float, float]:
+        patterns = (
+            r"Read Latency[^:]*:\s*([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)",
+            r"Write Latency[^:]*:\s*([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)",
+            r"Read Dynamic Energy[^:]*:\s*([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)",
+            r"Write Dynamic Energy[^:]*:\s*([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)",
+            r"Leakage Power[^:]*:\s*([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)",
+            r"Area[^:]*:\s*([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)",
+        )
+        values: list[float] = []
+        for pattern in patterns:
+            match = re.search(pattern, output)
+            if match is None:
+                raise ValueError(f"DESTINY output missing required field matching {pattern}")
+            values.append(float(match.group(1)))
+        return tuple(values)  # type: ignore[return-value]

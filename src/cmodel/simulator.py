@@ -1,114 +1,89 @@
-"""Public strict C-model facade."""
+"""Strict simulator facade."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Mapping
+from dataclasses import asdict, dataclass
+from typing import Any
 
-from .backends import RecordedSystolicBackend, ScaleSimBackend, SystolicBackend
+from .backends import BookSim2Backend, Ramulator2Backend, SRAMMacroBackend, ScaleSimBackend
+from .backends.base import SRAMMacroResult
 from .config import CModelConfig
-from .errors import ConfigurationError
-from .ir import GemmOp
+from .errors import CModelError
 from .lowering import ArchitectureLowerer
-from .resources import EventSimulator, ResourceGraph, SimulationResult
+from .operators import Operator
+from .scheduler import CycleScheduler, SimulationResult
 
 
 @dataclass(frozen=True, slots=True)
 class CModelRun:
-    operation: GemmOp
+    operation: Operator
     result: SimulationResult
-    metadata: Mapping[str, Any]
+    program_metadata: dict[str, Any]
+    manifest: dict[str, Any]
 
-    def to_dict(self, frequency_hz: int) -> dict:
+    def to_dict(self, frequency_hz: int) -> dict[str, Any]:
         report = self.result.to_dict(frequency_hz)
-        report["operation"] = {
-            "op_id": self.operation.op_id,
-            "m": self.operation.m,
-            "n": self.operation.n,
-            "k": self.operation.k,
-            "mac_count": self.operation.mac_count,
-            "input_bits": self.operation.input_bits,
-            "weight_bits": self.operation.weight_bits,
-            "accumulator_bits": self.operation.accumulator_bits,
-        }
-        report["model"] = dict(self.metadata)
+        report["operation"] = asdict(self.operation)
+        report["program"] = dict(self.program_metadata)
+        report["model_manifest"] = dict(self.manifest)
         return report
 
 
 class StrictCModel:
-    def __init__(self, config: CModelConfig, backend: SystolicBackend | None = None):
+    def __init__(
+        self,
+        config: CModelConfig,
+        scalesim,
+        ramulator2,
+        booksim2,
+        macro_result: SRAMMacroResult,
+    ):
         self.config = config
-        self.backend = backend if backend is not None else self._build_backend(config)
-        self.resources = ResourceGraph.from_architecture(config.architecture)
+        self.scalesim = scalesim
+        self.ramulator2 = ramulator2
+        self.booksim2 = booksim2
+        self.macro_result = macro_result
+        self.used = False
 
-    @staticmethod
-    def _build_backend(config: CModelConfig) -> SystolicBackend:
-        options = dict(config.backend.options)
-        if config.backend.kind == "recorded":
-            allowed = {"result_path"}
-            unknown = set(options) - allowed
-            if unknown:
-                raise ConfigurationError(
-                    f"unknown recorded backend options: {sorted(unknown)}"
-                )
-            if "result_path" not in options:
-                raise ConfigurationError("recorded backend requires result_path")
-            return RecordedSystolicBackend(Path(str(options["result_path"])))
-
-        allowed = {
-            "architecture_config",
-            "python_executable",
-            "module",
-            "timeout_seconds",
-            "trace_word_bytes",
-            "expected_version",
-            "keep_outputs",
-        }
-        unknown = set(options) - allowed
-        if unknown:
-            raise ConfigurationError(
-                f"unknown SCALE-Sim backend options: {sorted(unknown)}"
-            )
-        if "architecture_config" not in options:
-            raise ConfigurationError(
-                "SCALE-Sim backend requires architecture_config; no fallback is available"
-            )
-        return ScaleSimBackend(
-            architecture_config=str(options["architecture_config"]),
-            python_executable=str(options.get("python_executable", "python3")),
-            module=str(options.get("module", "scalesim.scale")),
-            timeout_seconds=int(options.get("timeout_seconds", 600)),
-            trace_word_bytes=int(options.get("trace_word_bytes", 1)),
-            expected_version=(
-                None
-                if options.get("expected_version") is None
-                else str(options["expected_version"])
-            ),
-            keep_outputs=(
-                None
-                if options.get("keep_outputs") is None
-                else str(options["keep_outputs"])
-            ),
+    @classmethod
+    def from_config(cls, config: CModelConfig) -> "StrictCModel":
+        macro_result = SRAMMacroBackend(config.backends.sram_macro).run()
+        return cls(
+            config=config,
+            scalesim=ScaleSimBackend(config.backends.scalesim, config.architecture.arrays),
+            ramulator2=Ramulator2Backend(config.backends.ramulator2, config.architecture.dram),
+            booksim2=BookSim2Backend(config.backends.booksim2, config.architecture.noc),
+            macro_result=macro_result,
         )
 
-    def simulate_gemm(self, op: GemmOp) -> CModelRun:
-        lowerer = ArchitectureLowerer(
-            architecture=self.config.architecture,
-            mapping=self.config.mapping,
-            backend=self.backend,
+    def simulate(self, operation: Operator) -> CModelRun:
+        if self.used:
+            raise CModelError("StrictCModel instances simulate exactly one lowered program")
+        self.used = True
+        lowerer = ArchitectureLowerer(self.config, self.scalesim, self.macro_result)
+        program = lowerer.lower(operation)
+        scheduler = CycleScheduler(
+            self.config,
+            self.macro_result,
+            self.ramulator2,
+            self.booksim2,
         )
-        program = lowerer.lower_gemm(op)
-        result = EventSimulator(self.resources).run(program)
-        return CModelRun(
-            operation=op,
-            result=result,
-            metadata={
-                "architecture": self.config.architecture.name,
-                "compute_placement": self.config.architecture.placement.value,
-                "backend": self.config.backend.kind,
-                "backend_runs": program.metadata.get("backend_runs", 0),
-                "backend_manifests": program.metadata.get("backend_manifests", []),
-                "micro_op_count": len(program.operations),
+        result = scheduler.run(program)
+        self.ramulator2.close()
+        self.booksim2.close()
+        manifest = {
+            "architecture": self.config.architecture.name,
+            "compute_placement": self.config.architecture.compute_placement,
+            "frequency_hz": self.config.architecture.frequency_hz,
+            "array": asdict(self.config.architecture.arrays),
+            "mapping": asdict(self.config.mapping),
+            "backends": {
+                "scalesim_commit": self.config.backends.scalesim.repository.expected_commit,
+                "ramulator2_commit": self.config.backends.ramulator2.repository.expected_commit,
+                "booksim2_commit": self.config.backends.booksim2.repository.expected_commit,
+                "sram_macro_kind": self.config.backends.sram_macro.kind,
+                "sram_macro_commit": self.config.backends.sram_macro.repository.expected_commit,
             },
-        )
+            "sram_macro": asdict(self.macro_result),
+        }
+        return CModelRun(operation, result, dict(program.metadata), manifest)

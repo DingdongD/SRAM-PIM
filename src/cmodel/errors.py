@@ -1,42 +1,33 @@
-"""Strict C-model exception hierarchy.
-
-The production simulator is deliberately fail-closed: unsupported operations,
-missing external tools, malformed traces, and invalid resource mappings are
-reported as errors instead of silently switching to an analytical model.
-"""
+"""Errors raised by the strict architecture C-model."""
 
 
 class CModelError(RuntimeError):
-    """Base exception for all strict C-model failures."""
+    """Base class for strict C-model failures."""
 
 
 class ConfigurationError(CModelError):
-    """Raised when an architecture or backend configuration is invalid."""
+    """Configuration is incomplete or inconsistent."""
 
 
-class UnsupportedOperatorError(CModelError):
-    """Raised when the functional IR contains an unsupported operation."""
+class BackendError(CModelError):
+    """External simulator integration failed."""
 
 
-class BackendUnavailableError(CModelError):
-    """Raised when a required external backend cannot be executed."""
+class BackendProtocolError(BackendError):
+    """External simulator violated the declared protocol."""
 
 
-class BackendExecutionError(CModelError):
-    """Raised when an external backend exits unsuccessfully."""
-
-
-class BackendOutputError(CModelError):
-    """Raised when backend output is missing, ambiguous, or malformed."""
+class BackendVersionError(BackendError):
+    """External simulator version or commit does not match the configuration."""
 
 
 class MappingError(CModelError):
-    """Raised when an operation cannot be mapped onto the declared hardware."""
+    """Operator cannot be mapped under the declared mapping."""
 
 
 class ResourceError(CModelError):
-    """Raised when a micro-operation requests an invalid resource."""
+    """A resource request is invalid or cannot be serviced."""
 
 
 class DeadlockError(CModelError):
-    """Raised when the micro-operation graph cannot make progress."""
+    """Simulation cannot make forward progress."""
