@@ -7,7 +7,6 @@ on:
 
 permissions:
   contents: write
-  pull-requests: read
 
 jobs:
   apply:
@@ -20,15 +19,23 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          curl --fail --silent --show-error \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/DingdongD/SRAM-PIM/pulls/1" |
-            jq -r '.body' |
-            LC_ALL=C tr -cd 'A-Za-z0-9+/=\n' |
-            base64 --decode > /tmp/strict-update.tar.xz
-          echo "8b85cc22c5ddd20d5317cb984e82a671483c394401f7a2cb65cb603058eff9df  /tmp/strict-update.tar.xz" |
+          : > /tmp/strict-final.b64
+          for blob in \
+            09fbc2997e7cb990cc8dcea40c3423be2ce00338 \
+            7ebd00eb70ce3dc902f09d890335c059587146f2 \
+            d672a3de4a988745d707201c1498ff9af2dcc242 \
+            4849fcee33148281e509d3c58827824f2db59d3b
+          do
+            curl --fail --silent --show-error \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/DingdongD/SRAM-PIM/git/blobs/${blob}" |
+              jq -r '.content' |
+              base64 --decode >> /tmp/strict-final.b64
+          done
+          base64 --decode /tmp/strict-final.b64 > /tmp/strict-final.tar.xz
+          echo "fbbe0331df07193262c0137369724d7215ca0b16fdaf8ec30ac134e4bec69171  /tmp/strict-final.tar.xz" |
             sha256sum --check -
           rm -f \
             src/cmodel/architecture.py \
@@ -36,7 +43,7 @@ jobs:
             src/cmodel/backends/recorded.py \
             tests/test_cmodel_engine.py \
             tests/test_cmodel_strictness.py
-          tar -xJf /tmp/strict-update.tar.xz -C .
+          tar -xJf /tmp/strict-final.tar.xz -C .
           rm -f .github/workflows/apply-strict-update.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
