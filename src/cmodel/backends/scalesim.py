@@ -115,8 +115,8 @@ class ScaleSimBackend:
     def _write_topology(path: Path, op_id: str, m: int, n: int, k: int) -> None:
         with path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.writer(handle)
-            writer.writerow(["Layer Name", "M", "N", "K"])
-            writer.writerow([op_id, m, n, k])
+            writer.writerow(["Layer Name", "M", "N", "K", ""])
+            writer.writerow([op_id, m, n, k, ""])
 
     @staticmethod
     def _parse_report(path: Path) -> tuple[int, float]:
