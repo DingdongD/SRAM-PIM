@@ -10,6 +10,7 @@ SCALESIM_COMMIT="9f98c4371055a54c75209c2e02b640b897550532"
 RAMULATOR_COMMIT="b30320bc9385b708e86b67ebb9f48858cc66d798"
 BOOKSIM_COMMIT="28f43299f1706a3160ffac721ca461d74eb6e618"
 CACTI_COMMIT="1ffd8dfb10303d306ecd8d215320aea07651e878"
+NUMPY_VERSION="1.26.4"
 
 mkdir -p "${THIRD_PARTY}" "${BIN}"
 
@@ -18,9 +19,13 @@ test ! -e "${THIRD_PARTY}/ramulator2"
 test ! -e "${THIRD_PARTY}/booksim2"
 test ! -e "${THIRD_PARTY}/cacti"
 
+python3 -m pip install "numpy==${NUMPY_VERSION}"
+python3 -c "import numpy; assert numpy.__version__ == '${NUMPY_VERSION}'"
+
 git clone https://github.com/scalesim-project/SCALE-Sim.git "${THIRD_PARTY}/scalesim"
 git -C "${THIRD_PARTY}/scalesim" checkout "${SCALESIM_COMMIT}"
 python3 -m pip install -e "${THIRD_PARTY}/scalesim"
+python3 -c "import numpy; assert numpy.__version__ == '${NUMPY_VERSION}'"
 
 git clone https://github.com/CMU-SAFARI/ramulator2.git "${THIRD_PARTY}/ramulator2"
 git -C "${THIRD_PARTY}/ramulator2" checkout "${RAMULATOR_COMMIT}"
