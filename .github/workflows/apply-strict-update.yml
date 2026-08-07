@@ -43,8 +43,7 @@ jobs:
             src/cmodel/backends/recorded.py \
             tests/test_cmodel_engine.py \
             tests/test_cmodel_strictness.py
-          tar -xJf /tmp/strict-final.tar.xz -C .
-          rm -f .github/workflows/apply-strict-update.yml
+          tar -xJf /tmp/strict-final.tar.xz -C . --exclude='.github/workflows/strict-cmodel.yml'
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
